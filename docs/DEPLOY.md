@@ -23,10 +23,10 @@ Only Caddy publishes ports. `app` and `db` are reachable only on the compose net
    | Variable | Meaning |
    |---|---|
    | `DOMAIN` | the hostname, no scheme |
-   | `PUBLIC_ORIGIN` | `https://<domain>`, no trailing slash |
-   | `POSTGRES_PASSWORD` | long random string (`openssl rand -hex 24`) |
+   | `PUBLIC_ORIGIN` | `https://<domain>`, no trailing slash. The host must be a valid DNS hostname (letters, digits and hyphens, dotted) or an IP, and must equal `DOMAIN` (compose passes `DOMAIN` to the app, which checks it). |
+   | `POSTGRES_PASSWORD` | long random string (`openssl rand -hex 24`), at least 16 characters |
    | `MIGRATE_DATABASE_URL` | owner role: `postgresql+psycopg://tracker:<POSTGRES_PASSWORD>@db:5432/tracker`. Only the `migrate` service gets it. |
-   | `DATABASE_URL` | app role: `postgresql+psycopg://tracker_app:<another random password>@db:5432/tracker` (use hex, so nothing needs URL-encoding) |
+   | `DATABASE_URL` | app role: `postgresql+psycopg://tracker_app:<another random password>@db:5432/tracker` (use hex, so nothing needs URL-encoding). Scheme `postgresql` or `postgresql+psycopg`; at least 16 characters, and different from the owner's password. |
    | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | from step 3 |
    | `COOKIE_SECURE` | `1` |
    | `APP_IMAGE` | optional tag to run, see Updating |
@@ -35,7 +35,7 @@ Only Caddy publishes ports. `app` and `db` are reachable only on the compose net
    docker compose -f compose.prod.yaml up -d --build
    docker compose -f compose.prod.yaml ps
    ```
-   `migrate` runs `alembic upgrade head` and (re)creates the `tracker_app` role on every start, then `app` serves. The app refuses to start while `change-me` is left in a URL, or when `PUBLIC_ORIGIN` is unset or not https. Caddy requests the certificate on first request; watch `docker compose -f compose.prod.yaml logs caddy`.
+   `migrate` runs `alembic upgrade head` and (re)creates the `tracker_app` role on every start, then `app` serves. The app refuses to start while `change-me` is left in a URL, when a database password is shorter than 16 characters or the two are equal, when `DATABASE_URL` is not `postgresql`/`postgresql+psycopg`, or when `PUBLIC_ORIGIN` is unset, not https, has an invalid hostname or a different host than `DOMAIN`. Caddy requests the certificate on first request; watch `docker compose -f compose.prod.yaml logs caddy`.
 6. Open `https://<domain>/`.
 
 ## Loading data
@@ -72,11 +72,12 @@ docker tag wardogs-patch-tracker:latest wardogs-patch-tracker:previous
 
 ## Backup and restore
 
-Backup (custom format, safe while running):
+Backup (custom format, safe while running). Write to a directory **outside the repo**. The repo ignores `*.dump` and `backup-*` and `.dockerignore` keeps them out of the build context, but a directory elsewhere removes the risk altogether:
 
 ```
-( umask 077; docker compose -f compose.prod.yaml exec -T db pg_dump -U tracker -Fc tracker > backup-$(date +%F).dump )
-chmod 600 backup-*.dump
+mkdir -p -m 700 ~/tracker-backups
+( umask 077; docker compose -f compose.prod.yaml exec -T db pg_dump -U tracker -Fc tracker > ~/tracker-backups/backup-$(date +%F).dump )
+chmod 600 ~/tracker-backups/backup-*.dump
 ```
 
 **A dump contains secrets**: webhook URLs (a webhook URL is a credential: anyone holding it can post to that channel), Discord user ids and session data. Hence `umask 077` (the file is created owner-only; a plain `>` would make it readable by everyone under the default umask) and `chmod 600`. Keep dumps out of shared directories, and encrypt every copy that leaves the host, for example with age (`age -r <public-key> -o backup.dump.age backup.dump`, decrypt with `age -d -i key.txt backup.dump.age`) or gpg (`gpg --encrypt --recipient <you> backup.dump`). Keep the private key somewhere other than the backup target, and delete any plaintext copy made only for the upload.
@@ -86,7 +87,7 @@ Restore into the running stack (replaces the data):
 ```
 docker compose -f compose.prod.yaml stop app
 docker compose -f compose.prod.yaml exec -T db psql -U tracker -d postgres -c 'DROP DATABASE tracker WITH (FORCE)' -c 'CREATE DATABASE tracker'
-docker compose -f compose.prod.yaml exec -T db pg_restore -U tracker -d tracker --no-owner < backup-YYYY-MM-DD.dump
+docker compose -f compose.prod.yaml exec -T db pg_restore -U tracker -d tracker --no-owner < ~/tracker-backups/backup-YYYY-MM-DD.dump
 docker compose -f compose.prod.yaml start app
 ```
 
@@ -112,11 +113,13 @@ Two roles, two URLs:
 `tracker_app` extras, all set by `db_setup.py`:
 
 - No `TEMP` privilege (revoked from `PUBLIC` and from the role): it cannot create temporary tables.
+- No `CONNECT` to the `postgres` and `template1` maintenance databases (`REVOKE CONNECT, TEMP ... FROM PUBLIC`), so it cannot create temp tables or large objects there. The owner `tracker` is the bootstrap superuser and is unaffected, as are the `pg_isready` healthcheck and `pg_dump` (both run as `tracker`).
+- **`ALTER ROLE tracker_app SET ...` settings are persistent, and `db_setup.py` resets them.** `statement_timeout = 5s` is stored on the role in the database. A setting you add by hand (for example a longer timeout for a one-off job) survives restarts, but the `migrate` service re-runs `ALTER ROLE tracker_app SET statement_timeout = '5s'` on every deploy, so a hand-set `statement_timeout` is reset. Settings it does not name are left alone. For a permanent change edit `db_setup.py`; for a one-off use `SET` in the session.
 - `statement_timeout = 5s` as the role default, so a runaway query in `tracker ingest`/`notify` or an ad-hoc session is cancelled. A session may still `SET statement_timeout` itself (the API sets its own value), so this guards against accidents, not against a compromised app.
 - No per-role `CONNECTION LIMIT` (`-1`): on Postgres 16.15 a burst of connections past a role's limit crash-restarted
   the whole server, so a limit would itself be a denial of service. Connections are bounded by the API pool (15), the
   CLI runs and the statement timeouts instead.
-- The script refuses empty, whitespace-only and placeholder passwords (`change-me`, `changeme`, `password`, any case) for both roles, and a role name equal to the owner, `postgres` or `pg_*`.
+- The script refuses empty, whitespace-only and placeholder passwords (`change-me`, `changeme`, `password`, any case), passwords shorter than 16 characters, and equal passwords for the two roles (the app enforces the same at startup), and a role name equal to the owner, `postgres` or `pg_*`.
 - The password is sent as a SCRAM verifier, and the session turns statement logging off (`log_min_error_statement = panic`, `log_statement = none`), so a failed `CREATE`/`ALTER ROLE` cannot leave the plaintext in the Postgres log.
 
 `docker compose run app tracker ingest ...` and `exec app tracker notify ...` use `DATABASE_URL`, so they run as `tracker_app`.
@@ -143,11 +146,35 @@ Docker publishes ports by writing its own NAT and forward rules, which are evalu
 
 **Raspberry Pi**: nothing inbound from the internet. Funnel makes an outbound connection to Tailscale. Allow SSH only from the LAN or the tailnet (for example `ufw allow from 192.168.1.0/24 to any port 22`). Port 8080 is bound to `127.0.0.1`, so the LAN cannot reach it on Engine 28 or newer.
 
+**Raspberry Pi, optional: stop other Docker networks from reaching Caddy (Linux host verification step).** On Docker Desktop (Windows, macOS) a container on another bridge, such as the default one, can open the `edge` network's Caddy address directly (measured: `REACHABLE`). Caddy trusts `X-Forwarded-For` only from the `edge` gateway, so such a connection cannot spoof the client address, but it can still reach the port. On a Linux host the rules below drop it. They were not run in this repository's tests (Docker Desktop's VM), so confirm them on the Pi:
+
+```
+EDGE=172.29.58.0/24   # EDGE_SUBNET of compose.pi.yaml
+BR=br-$(docker network inspect -f '{{.Id}}' wardogs-patch-tracker_edge | cut -c1-12)   # <project folder name>_edge
+sudo iptables -I DOCKER-USER -i docker0 -d $EDGE -j DROP
+sudo iptables -I DOCKER-USER -i 'br-+' -d $EDGE -j DROP
+sudo iptables -I DOCKER-USER -i "$BR" -j RETURN   # the edge bridge itself stays allowed (inserted last, so evaluated first)
+```
+
+Use this on the Pi only: on the VPS, published ports reach Caddy through the same chain and the rules would block them. The Funnel path (host to `127.0.0.1:8080`) is local traffic and does not cross `DOCKER-USER`. Persist the rules; the bridge name changes when the network is recreated (`docker compose down`), so re-run the `BR` rule then. Test, with the stack up:
+
+```
+docker run --rm busybox wget -T 3 -q -O /dev/null http://172.29.58.254:8080/ && echo "REACHABLE: rule missing" || echo "blocked: ok"
+```
+
+It must print `blocked: ok`, while `curl -i http://127.0.0.1:8080/api/builds` on the Pi still answers.
+
 Verify from a different machine: `nmap -Pn -p 22,80,443,5432,8000,8080 <host>` must show only the ports you meant to open; on the host, `ss -ltnp` must list only `0.0.0.0:80`/`:443` (VPS) or `127.0.0.1:8080` (Pi) from Docker.
 
 ## Updating pinned images
 
-All images are pinned to exact tags: `node`, `python`, `caddy` and `ghcr.io/astral-sh/uv` in the `Dockerfile`, `postgres` in `compose.prod.yaml` and `compose.pi.yaml`. The app image's last stage holds only the finished virtualenv and the app: no `uv`, `pip`, `setuptools` or `wheel` (check with `docker scout cves <image>`). The Caddy image is built from the pinned `caddy` tag with the web app copied in (`docker compose build caddy`). All are multi-arch (amd64 and arm64). To update: pick the new tag (Docker Hub tags page; `docker buildx imagetools inspect <image:tag>` should list `linux/arm64`), change it in every file (`grep -rn "postgres:16\|caddy:2\|python:3\|node:24\|astral-sh/uv:" Dockerfile compose*.yaml`; `compose.dev.yaml` uses the floating `postgres:16` on purpose), rebuild and run the tests. Minor Postgres updates (16.x) are safe; a new major needs a dump and restore. For reproducible builds you can also append a digest (`image:tag@sha256:...`, from `imagetools inspect`), at the cost of updating it by hand.
+All images are pinned to exact tags: `node`, `python`, `caddy` and `ghcr.io/astral-sh/uv` in the `Dockerfile`, `postgres` in `compose.prod.yaml` and `compose.pi.yaml`. The app image's last stage holds only the finished virtualenv and the app: no `uv`, `pip`, `setuptools` or `wheel` (check with `docker scout cves <image>`). The Caddy image is built from the pinned `caddy` tag, but its binary is rebuilt from source (see "Caddy build" below) and the web app copied in (`docker compose build caddy`). All are multi-arch (amd64 and arm64). To update: pick the new tag (Docker Hub tags page; `docker buildx imagetools inspect <image:tag>` should list `linux/arm64`), change it in every file (`grep -rn "postgres:16\|caddy:2\|python:3\|node:24\|astral-sh/uv:" Dockerfile compose*.yaml`; `compose.dev.yaml` uses the floating `postgres:16` on purpose), rebuild and run the tests. Minor Postgres updates (16.x) are safe; a new major needs a dump and restore. For reproducible builds you can also append a digest (`image:tag@sha256:...`, from `imagetools inspect`), at the cost of updating it by hand.
+
+## Caddy build
+
+The published `caddy:2.11.7` binary was built with Go 1.26.8 and `golang.org/x/net` 0.59.0. `docker scout` reported 4 critical and 15 high fixable CVEs for it (stdlib, x/net, go-jose, chi). The `Dockerfile` rebuilds the same Caddy version from source in a `caddy:2.11.7-builder` stage with a pinned patched toolchain (`GOTOOLCHAIN=go1.26.10`) and `xcaddy --replace` pins for `golang.org/x/net` (0.62.0), `go-jose/v4` (4.1.6) and `go-chi/chi/v5` (5.4.0). The binary is copied into the pinned `caddy:2.11.7` runtime and the result is flattened into a fresh image, so the old binary does not stay in a lower layer where scanners still find it. The file capability (`cap_net_bind_service`), the non-root user (65532), `/srv`, env, ports and default command are kept. Check a build with `docker run --rm --entrypoint caddy <caddy image> version`, and `go version -m` on the binary (`docker cp`) for the module versions.
+
+To update, bump together: the `caddy:` tags and `CADDY_VERSION` in the `Dockerfile`, the `xcaddy build vX.Y.Z` version, and the `GOTOOLCHAIN` / `--replace` versions whenever `docker scout cves --only-fixed <image>` lists newer fixes. Findings left after the rebuild have no fixed version yet (for example `go-jose/v3`, pulled in by a Caddy dependency).
 
 ## Notes
 
@@ -165,11 +192,11 @@ All images are pinned to exact tags: `node`, `python`, `caddy` and `ghcr.io/astr
 - Caddy: 64 KB request body cap on every path (413 beyond it); `read_header 10s`, `read_body 30s`, `idle 2m` timeouts on every listener, port 80 included.
 - Every response Caddy writes itself carries the security headers: the 413, the http to https redirect, an unknown `Host` (404), error pages and the 405. `Server` and `Via` are removed.
 - The uvicorn access log drops query strings, so OAuth `code`/`state` values never reach the logs.
-- The app refuses to start with an empty or placeholder database password (`change-me`, `changeme`, `password`, any case), or unless `PUBLIC_ORIGIN` is exactly `https://host[:port]` (no path, query, fragment, user info or whitespace). `COOKIE_SECURE=0` is accepted only together with `http://localhost` or `http://127.0.0.1`, and that origin only with `COOKIE_SECURE=0`.
+- The app refuses to start with an empty, placeholder or short (under 16 characters) database password, equal owner and app passwords, a `DATABASE_URL` that is not `postgresql`/`postgresql+psycopg`, or unless `PUBLIC_ORIGIN` is exactly `https://host[:port]` (no path, query, fragment, user info or whitespace; a valid DNS hostname or IP; a port from 1 to 65535; equal to `DOMAIN` where that is set). `COOKIE_SECURE=0` is accepted only together with `http://localhost` or `http://127.0.0.1`, and that origin only with `COOKIE_SECURE=0`.
 - `app` and `caddy` run with a read-only root filesystem (`/tmp` is a small tmpfs), all capabilities dropped (Caddy keeps `NET_BIND_SERVICE`), `no-new-privileges`, and memory and process limits. `db` has `no-new-privileges` and limits but a writable root filesystem (Postgres needs it). `app` and `caddy` run as non-root users. Every service logs with `json-file`, rotated at 3 files of 10 MB.
 - The app uses a DML-only database role (see "Database roles"); `db` is on an internal network with no outside access.
 - `COOKIE_SECURE=1`; secrets only in `.env` (git- and image-excluded), never in images.
-- Static serving resists path traversal and lists no directories; `/api/*` never falls back to the web app.
+- Static serving resists path traversal and lists no directories; `/api/*` never falls back to the web app. Caddy proxies only the exact lower-case `/api` prefix (`path_regexp ^/api(/|$)`); `/API/...` and other case variants get the static SPA from Caddy and never reach the app. A `308` from the static file server is not cached as `immutable`. The Caddy admin-API healthcheck requests are excluded from the Caddy log.
 - Container healthchecks and restart policy; `app` waits for `migrate`, Caddy for a healthy app.
 - Server version header is off; responses are gzip/zstd compressed.
 - Images pinned to exact tags, at the newest patch releases of `caddy` 2.11, `postgres` 16 and `python` 3.13 at the time of writing. The app image has no `uv`, `pip` or `setuptools`.
@@ -179,7 +206,7 @@ All images are pinned to exact tags: `node`, `python`, `caddy` and `ghcr.io/astr
 - **Rate limiting at the proxy**: Caddy has none (it needs a custom build with `xcaddy`). The app has its own limits in code; for more, limit at the host or provider firewall.
 - No automated backups, log shipping or monitoring.
 - Image digests are not pinned (tags only).
-- The Caddy image still reports Go standard library and `golang.org/x/net` CVEs in `docker scout`, because they are compiled into the newest `caddy` release; they clear when upstream ships a rebuilt tag (bump the tag in the `Dockerfile`).
+- Residual Caddy findings in `docker scout` have no fixed version (see "Caddy build").
 
 ## Raspberry Pi with Tailscale Funnel
 
@@ -197,7 +224,7 @@ internet -> Tailscale relay (TLS) -> tailscaled on the Pi -> 127.0.0.1:8080 cadd
 6. **Expose**: `sudo tailscale funnel --bg 8080`. Funnel listens externally only on 443, 8443 and 10000; the number you pass is the local port. Verify with `tailscale funnel status` and from another network: `https://<host>.<tailnet>.ts.net/`.
 7. **Discord**: add the redirect URI `https://<host>.<tailnet>.ts.net/api/auth/callback` to the application (step 3 of "First deploy").
 8. **Only this service on Funnel.** `tailscale funnel` exposes just the port you name. Leave SSH and every other Pi service off Funnel, keep them bound to localhost or the tailnet, and keep SSH on key authentication. **Scope check, after every Tailscale change and before announcing the URL:** `tailscale funnel status` must show exactly one entry, `https://<host>.<tailnet>.ts.net (Funnel on)` proxying to `http://127.0.0.1:8080`, and nothing else; `tailscale serve status` shows the same set. Anything extra is public: remove it with `sudo tailscale funnel --https=<port> off`.
-9. **Backups off the Pi.** The Pi's storage is otherwise the only copy of the data. Run the `pg_dump` from "Backup and restore" from cron (use `-f compose.pi.yaml`; keep the `umask 077`/`chmod 600`, the dump contains webhook URLs), encrypt it with age or gpg, and copy it to another machine or object storage (`rclone`, `scp`, a NAS). Test a restore. Also open nothing inbound on the Pi apart from SSH from the LAN or tailnet (see "Firewall").
+9. **Backups off the Pi.** The Pi's storage is otherwise the only copy of the data. Run the `pg_dump` from "Backup and restore" from cron (use `-f compose.pi.yaml`; write to `~/tracker-backups` as in that section, keep the `umask 077`/`chmod 600`, the dump contains webhook URLs), encrypt it with age or gpg, and copy it to another machine or object storage (`rclone`, `scp`, a NAS). Test a restore. Also open nothing inbound on the Pi apart from SSH from the LAN or tailnet (see "Firewall").
 10. **Storage**: Postgres writes constantly, and SD cards wear out and can corrupt on power loss. Prefer a USB SSD for the OS or at least the Docker data root (`/var/lib/docker`); if you stay on an SD card, use a high-endurance card and keep frequent off-Pi backups.
 
 ### Client IP behind Funnel
