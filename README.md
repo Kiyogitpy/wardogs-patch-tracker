@@ -6,12 +6,15 @@ History, search and alerts for Wardogs game data across builds. It ingests the p
 ## Setup
 
 ```
-docker compose up -d                       # Postgres 16 on 127.0.0.1:5433
+docker compose -f compose.dev.yaml up -d  # Postgres 16 on 127.0.0.1:5433
 uv sync
 export DATABASE_URL=postgresql+psycopg://tracker:tracker@127.0.0.1:5433/tracker
 uv run alembic upgrade head
 uv run pytest                              # creates and migrates its own tracker_test database
 ```
+
+The dev file is `compose.dev.yaml`, so a bare `docker compose up` in this folder does nothing. The server stacks are `compose.prod.yaml`
+and `compose.pi.yaml` (see `docs/DEPLOY.md`).
 
 ## Ingest a build
 
