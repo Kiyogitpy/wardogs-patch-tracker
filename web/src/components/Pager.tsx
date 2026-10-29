@@ -3,13 +3,13 @@ export default function Pager({ page, pages, onPage }: { page: number; pages: nu
   return (
     <nav className="pager" aria-label="Pagination">
       <button type="button" className="btn" disabled={page <= 1} onClick={() => onPage(page - 1)}>
-        &larr; Previous
+        Previous
       </button>
       <span>
         Page {page} of {pages}
       </span>
       <button type="button" className="btn" disabled={page >= pages} onClick={() => onPage(page + 1)}>
-        Next &rarr;
+        Next
       </button>
     </nav>
   )

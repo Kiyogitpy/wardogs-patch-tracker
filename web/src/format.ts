@@ -77,3 +77,8 @@ export function inlineText(v: Json): string {
 export function totalAssets(c: { added: number; removed: number; modified: number; moved: number }): number {
   return c.added + c.removed + c.modified + c.moved
 }
+
+/** Text of a delta tag: "−15 · −25%", or just "−15" when there is no percent. */
+export function deltaText(d: Delta): string {
+  return d.pct ? `${d.delta} · ${d.pct}` : d.delta
+}

@@ -3,9 +3,10 @@ import { Link, useParams, useSearchParams } from 'react-router'
 import { getAssets, getBuild, PAGE_SIZE, STATUSES } from '../api'
 import AssetCard from '../components/AssetCard'
 import { Empty, ErrorBox, Loading, NotFound } from '../components/State'
-import { nf, STATUS_META, StatList } from '../components/Stats'
+import { nf, STATUS_META, StatLedger } from '../components/Stats'
+import { BuildMeta } from './Timeline'
 import { useRemote, useTitle, useUrlText } from '../hooks'
-import { apiQuery, EMPTY_FILTERS, filtersToParams, parseFilters, type Filters } from '../query'
+import { apiQuery, changesToParams, EMPTY_CHANGES, EMPTY_FILTERS, filtersToParams, parseFilters, type Filters } from '../query'
 import { totalAssets } from '../format'
 
 export default function BuildDiff() {
@@ -29,7 +30,7 @@ export default function BuildDiff() {
 
   if (build.state === 'error' && build.error.status === 404) return <NotFound what="build" />
   if (build.state === 'loading') return <Loading what="build" />
-  if (build.state === 'error') return <ErrorBox error={build.error} onRetry={build.retry} />
+  if (build.state === 'error') return <ErrorBox what="the build" error={build.error} onRetry={build.retry} />
   const b = build.data
 
   const pages = assets.state === 'ok' ? Math.max(1, Math.ceil(assets.data.total / PAGE_SIZE)) : 1
@@ -43,26 +44,17 @@ export default function BuildDiff() {
   return (
     <>
       <p className="crumbs">
-        <Link to="/">&larr; All builds</Link>
+        <Link to="/">All builds</Link>
       </p>
-      <h1 className="page-title mono">{b.label}</h1>
-      <p className="meta">
-        <span>{b.released_at ? <time dateTime={b.released_at}>{b.released_at}</time> : 'release date unknown'}</span>
-        <span>Steam build {b.steam_buildid ?? 'unknown'}</span>
-        <span>
-          {b.prev_label ? (
-            <>
-              diffed against{' '}
-              <Link to={`/builds/${encodeURIComponent(b.prev_label)}`}>
-                <b>{b.prev_label}</b>
-              </Link>
-            </>
-          ) : (
-            'no previous build'
-          )}
-        </span>
-      </p>
-      <StatList counts={b.totals} className="stats-big" />
+      <header className="build-head">
+        <div className="rail">
+          <h1 className="crate">{b.label}</h1>
+        </div>
+        <div className="build-body">
+          <BuildMeta b={b} />
+          <StatLedger counts={b.totals} />
+        </div>
+      </header>
 
       <a className="skip-inline" href="#filters" onClick={(e) => { e.preventDefault(); document.getElementById("filters")?.querySelector("select")?.focus() }}>
         Skip to filters
@@ -124,8 +116,11 @@ export default function BuildDiff() {
           />
         </label>
         {fieldText.trim().length >= 2 && (
-          <Link className="side-link" to={`/changes?${new URLSearchParams({ field: fieldText.trim() })}`}>
-            search all builds &rarr;
+          <Link
+            className="side-link"
+            to={`/changes?${changesToParams({ ...EMPTY_CHANGES, field: fieldText.trim(), area: filters.area })}`}
+          >
+            Search all builds
           </Link>
         )}
         {hasFilters && (
@@ -142,7 +137,7 @@ export default function BuildDiff() {
             {assets.data.total > PAGE_SIZE && assets.data.items.length > 0 && (
               <span className="muted">
                 {' '}
-                &middot; page {filters.page} of {pages}
+                page {filters.page} of {pages}
               </span>
             )}
           </>
@@ -152,7 +147,7 @@ export default function BuildDiff() {
       </h2>
       <div aria-live="polite">
         {assets.state === 'loading' && <Loading what="assets" />}
-        {assets.state === 'error' && <ErrorBox error={assets.error} onRetry={assets.retry} />}
+        {assets.state === 'error' && <ErrorBox what="the assets" error={assets.error} onRetry={assets.retry} />}
         {assets.state === 'ok' && assets.data.items.length === 0 && assets.data.total > 0 && (
           <Empty>
             Page {filters.page} is past the end: there {pages === 1 ? 'is' : 'are'} {pages} page{pages === 1 ? '' : 's'} of
@@ -161,12 +156,29 @@ export default function BuildDiff() {
           </Empty>
         )}
         {assets.state === 'ok' && assets.data.items.length === 0 && assets.data.total === 0 && (
-          <Empty>{hasFilters ? 'No assets match these filters.' : 'This build has no changed assets.'}</Empty>
+          <Empty>
+            {hasFilters ? (
+              <>
+                No assets match these filters.{' '}
+                <Link
+                  to={`?${filtersToParams(EMPTY_FILTERS)}`}
+                  onClick={() => {
+                    setQText('')
+                    setFieldText('')
+                  }}
+                >
+                  Clear filters
+                </Link>
+              </>
+            ) : (
+              'This build has no changed assets.'
+            )}
+          </Empty>
         )}
       </div>
       {assets.state === 'ok' && assets.data.items.length > 0 && (
         <>
-          <div className="cards">
+          <div className="assets">
             {assets.data.items.map((a) => (
               <AssetCard key={a.path} asset={a} />
             ))}
@@ -174,13 +186,13 @@ export default function BuildDiff() {
           {pages > 1 && (
             <nav className="pager" aria-label="Pagination">
               <button type="button" className="btn" disabled={filters.page <= 1} onClick={() => goPage(filters.page - 1)}>
-                &larr; Previous
+                Previous
               </button>
               <span>
                 Page {filters.page} of {pages}
               </span>
               <button type="button" className="btn" disabled={filters.page >= pages} onClick={() => goPage(filters.page + 1)}>
-                Next &rarr;
+                Next
               </button>
             </nav>
           )}

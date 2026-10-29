@@ -3,11 +3,14 @@ import { Link, useLocation, useNavigate, useSearchParams } from 'react-router'
 import { getAssetHistory, type AssetHistory as History, type HistoryEntry } from '../api'
 import { ChangesTable } from '../components/AssetCard'
 import { Empty, ErrorBox, Loading, NotFound } from '../components/State'
-import { StatusBadge } from '../components/Stats'
+import { OpBadge, StatusBadge } from '../components/Stats'
 import Sparkline from '../components/Sparkline'
 import ValueView from '../components/ValueView'
+import DeltaTag from '../components/DeltaTag'
+import { statusBar } from '../components/AssetCard'
 import { numberPair } from '../format'
-import { groupByField, numericValues, stepDelta, type FieldSeries } from '../history'
+import { readableAsset } from '../hero'
+import { groupByField, numericValues, startLabel, stepDelta, type FieldSeries } from '../history'
 import { useRemote, useTitle, useUrlText } from '../hooks'
 import { assetApiQuery, assetToParams, parseAsset, type AssetState } from '../query'
 
@@ -28,11 +31,12 @@ function noiseText(n: HistoryEntry['noise']): string {
 
 function FieldCard({ series }: { series: FieldSeries }) {
   const nums = numericValues(series.values)
+  const labels = series.values.map((v) => (v.label === null ? 'Before' : v.label))
   return (
-    <article className="card field-card" aria-label={series.field}>
+    <article className="field-entry" aria-label={series.field}>
       <header className="field-head">
-        <h3 className="field-name">{series.field}</h3>
-        <Sparkline values={nums} name={series.field} />
+        <h3 className="field-name mono">{series.field}</h3>
+        <Sparkline values={nums} labels={labels} name={series.field} />
       </header>
       <ol className="seq">
         {series.values.map((v, i) => {
@@ -43,21 +47,13 @@ function FieldCard({ series }: { series: FieldSeries }) {
               ? numberPair(prev.value, v.value)
               : null
           return (
-            <li key={i} className={i === 0 ? 'seq-start' : ''}>
-              <span className="seq-build mono">
-                {i === 0 && v.label !== 'before' ? 'before ' : ''}
-                {v.label}
+            <li key={i} className={`step ${i === 0 ? 'step-start' : d ? 'hazard-row' : ''}`}>
+              <span className="step-build mono">{i === 0 ? startLabel(v.label) : v.label}</span>
+              <span className="step-val">
+                <ValueView value={v.value} numText={i === 0 ? undefined : pair?.[1]} absent={v.absent} />
               </span>
-              <span className="seq-val">
-                <ValueView value={v.value} numText={pair?.[1]} absent={v.absent} />
-              </span>
-              {v.op && v.op !== 'changed' && <span className={`op op-${v.op}`}>{v.op}</span>}
-              {d && (
-                <span className={`seq-delta ${d.delta.startsWith('+') ? 'up' : d.delta.startsWith('−') ? 'down' : ''}`}>
-                  {d.delta}
-                  {d.pct && <span className="pct"> ({d.pct})</span>}
-                </span>
-              )}
+              {v.op && v.op !== 'changed' && <OpBadge op={v.op} />}
+              {prev && d && <DeltaTag before={prev.value} after={v.value} />}
             </li>
           )
         })}
@@ -69,21 +65,22 @@ function FieldCard({ series }: { series: FieldSeries }) {
 function BuildSection({ h, name, filtered }: { h: HistoryEntry; name: string; filtered: boolean }) {
   const noiseTotal = Object.values(h.noise).reduce((a, b) => a + b, 0)
   return (
-    <section className="card build-sec" aria-label={`Build ${h.build.label}`}>
-      <header className="card-head">
-        <h3>
+    <section className="asset" aria-label={`Build ${h.build.label}`}>
+      <span className={`asset-bar ${statusBar(h.status)}`} aria-hidden="true" />
+      <header className="asset-head">
+        <h3 className="mono">
           <Link to={`/builds/${encodeURIComponent(h.build.label)}`}>{h.build.label}</Link>
         </h3>
         <StatusBadge status={h.status} />
-        <span className="chip">{h.area}</span>
-        {h.build.released_at && <time className="muted mono" dateTime={h.build.released_at}>{h.build.released_at}</time>}
+        <span className="tag">{h.area}</span>
+        {h.build.released_at && <time className="muted" dateTime={h.build.released_at}>{h.build.released_at}</time>}
       </header>
       {h.note && <p className="note">{h.note}</p>}
       {noiseTotal > 0 && <p className="note">Serialization noise: {noiseText(h.noise)}.</p>}
       {h.changes.length > 0 ? (
         <ChangesTable name={`${name} in ${h.build.label}`} changes={h.changes} />
       ) : (
-        <p className="muted none">{filtered ? 'no matching changes' : 'no field changes in this build'}</p>
+        <p className="muted none">{filtered ? 'No matching changes.' : 'No field changes in this build.'}</p>
       )}
     </section>
   )
@@ -94,9 +91,11 @@ export default function AssetHistory() {
   const state = parseAsset(sp)
   const navigate = useNavigate()
   const location = useLocation()
-  const movedState = (location.state as { movedFrom?: string } | null)?.movedFrom ?? null
+  const navState = location.state as { movedFrom?: string; forPath?: string } | null
 
-  const patch = (p: Partial<AssetState>, replace = false) => setSp(assetToParams({ ...state, ...p }), { replace })
+  // Carry the router state through later URL changes so the "moved from" note stays while the reader stays here.
+  const patch = (p: Partial<AssetState>, replace = false) =>
+    setSp(assetToParams({ ...state, ...p }), { replace, state: location.state })
   const [fieldText, setFieldText] = useUrlText(state.field, (field) => patch({ field }, true))
 
   const query = assetApiQuery(state)
@@ -113,7 +112,7 @@ export default function AssetHistory() {
     if (resolvedPath && resolvedPath !== state.path) {
       navigate(`/asset?${assetToParams({ ...state, path: resolvedPath })}`, {
         replace: true,
-        state: { movedFrom: state.path },
+        state: { movedFrom: state.path, forPath: resolvedPath },
       })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -123,8 +122,9 @@ export default function AssetHistory() {
 
   if (!state.path) return <NotFound what="asset" />
   if (res.state === 'error' && res.error.status === 404) return <NotFound what="asset" />
-  if (!data) return res.state === 'error' ? <ErrorBox error={res.error} onRetry={res.retry} /> : <Loading what="asset history" />
+  if (!data) return res.state === 'error' ? <ErrorBox what="the asset history" error={res.error} onRetry={res.retry} /> : <Loading what="asset history" />
 
+  const movedState = navState?.forPath === data.path ? (navState.movedFrom ?? null) : null
   const movedFrom = movedState ?? (data.path !== state.path ? state.path : null)
   const filtered = state.field !== ''
   const series = groupByField(data.history)
@@ -132,19 +132,20 @@ export default function AssetHistory() {
   return (
     <>
       <p className="crumbs">
-        <Link to="/search">&larr; Search assets</Link>
+        <Link to="/search">Search assets</Link>
       </p>
-      <h1 className="page-title mono">{data.name}</h1>
+      <h1 className="page-title">{readableAsset(data.name)}</h1>
       <p className="meta">
-        <span className="chip">{data.type}</span>
+        <span className="tag">{data.type}</span>
         <span>
           {data.history.length} build{data.history.length === 1 ? '' : 's'}
         </span>
       </p>
+      <p className="path" title="Full asset name">{data.name}</p>
       <p className="path">{data.path}</p>
       {movedFrom && (
         <p className="path old">
-          <span className="path-label">moved from</span> {movedFrom}
+          <span className="path-label">Moved from</span> {movedFrom}
         </p>
       )}
       {data.aliases.length > 0 && (
@@ -157,7 +158,7 @@ export default function AssetHistory() {
               <li key={`${a.build}:${a.old_path}`}>
                 <span className="path">{a.old_path}</span>{' '}
                 <span className="muted">
-                  moved in{' '}
+                  Moved in{' '}
                   <Link to={`/builds/${encodeURIComponent(a.build)}`} className="mono">
                     {a.build}
                   </Link>
@@ -201,13 +202,13 @@ export default function AssetHistory() {
       </div>
 
       <div aria-live="polite">{res.state === 'loading' && <Loading what="asset history" />}</div>
-      {res.state === 'error' && <ErrorBox error={res.error} onRetry={res.retry} />}
+      {res.state === 'error' && <ErrorBox what="the asset history" error={res.error} onRetry={res.retry} />}
 
       {state.view === 'field' ? (
         series.length === 0 ? (
           <Empty>{filtered ? 'No field matches this filter.' : 'No field-level changes recorded for this asset.'}</Empty>
         ) : (
-          <div className="cards">
+          <div className="assets">
             {series.map((s) => (
               <FieldCard key={s.field} series={s} />
             ))}
@@ -216,7 +217,7 @@ export default function AssetHistory() {
       ) : data.history.length === 0 ? (
         <Empty>This asset is in no ingested build.</Empty>
       ) : (
-        <div className="cards">
+        <div className="assets">
           {data.history.map((h) => (
             <BuildSection key={h.build.label} h={h} name={data.name} filtered={filtered} />
           ))}

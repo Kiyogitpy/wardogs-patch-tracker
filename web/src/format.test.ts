@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { inlineText, isLong, numericDelta } from './format'
+import { inlineText, isLong, numericDelta, deltaText } from './format'
 
 describe('numericDelta', () => {
   it('shows signed delta and percent', () => {
@@ -64,5 +64,14 @@ describe('close numbers (F5)', () => {
     expect(d.pct).toBe('+<0.1%')
     expect(numericDelta(0.00000001, 0.00000002)!.delta).not.toMatch(/e/i)
     expect(numericDelta(1e21, 2e21)!.delta).not.toMatch(/e/i)
+  })
+})
+
+describe('deltaText', () => {
+  it('joins delta and percent', () => {
+    expect(deltaText({ delta: '−15', pct: '−25%' })).toBe('−15 · −25%')
+  })
+  it('drops the percent when before is 0', () => {
+    expect(deltaText({ delta: '+3', pct: null })).toBe('+3')
   })
 })
