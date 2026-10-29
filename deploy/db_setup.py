@@ -22,6 +22,7 @@ def conn_args(url):
 
 
 PLACEHOLDERS = {"", "change-me", "changeme", "password"}
+MIN_PASSWORD_LENGTH = 16  # same rule as check_environment in src/tracker/server.py
 # -1 = no per-role limit. A limit was tried and dropped: on Postgres 16.15 a burst past a role's limit
 # crash-restarted the whole server, so the limit itself was a DoS. Load is bounded by the pools and timeouts.
 MAX_CONNECTIONS = -1
@@ -40,6 +41,13 @@ def main() -> int:
     if "change-me" in (owner_raw + app_raw).lower() or bad_password(owner.password) or bad_password(app.password):
         print("refusing to run with an empty, whitespace-only or placeholder password (change-me, changeme, password)",
               file=sys.stderr)
+        return 2
+    if len(owner.password) < MIN_PASSWORD_LENGTH or len(app.password) < MIN_PASSWORD_LENGTH:
+        print(f"both database passwords must be at least {MIN_PASSWORD_LENGTH} characters (openssl rand -hex 24)",
+              file=sys.stderr)
+        return 2
+    if owner.password == app.password:
+        print("DATABASE_URL and MIGRATE_DATABASE_URL must use different passwords", file=sys.stderr)
         return 2
     name = (app.username or "").lower()
     if not name or name in (owner.username.lower(), "postgres") or name.startswith("pg_"):
