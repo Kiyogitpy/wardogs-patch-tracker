@@ -33,7 +33,7 @@ export default function Timeline() {
       <h1 className="page-title">Build timeline</h1>
       <p className="lede">Every ingested build, newest first, with what changed compared to the build before it.</p>
       {r.state === 'loading' && <Loading what="builds" />}
-      {r.state === 'error' && <ErrorBox error={r.error} />}
+      {r.state === 'error' && <ErrorBox error={r.error} onRetry={r.retry} />}
       {r.state === 'ok' &&
         (r.data.length === 0 ? (
           <Empty>No builds have been ingested yet.</Empty>

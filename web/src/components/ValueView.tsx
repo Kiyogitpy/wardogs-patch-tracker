@@ -3,12 +3,12 @@ import type { Json } from '../api'
 import { inlineText, isLong, pretty } from '../format'
 
 /** One before/after value. Long containers collapse behind an expand button. */
-export default function ValueView({ value, absent }: { value: Json; absent?: boolean }) {
+export default function ValueView({ value, absent, numText }: { value: Json; absent?: boolean; numText?: string }) {
   const [open, setOpen] = useState(false)
   const id = useId()
   if (absent) return <span className="val val-absent" aria-label="not present">&mdash;</span>
   if (!isLong(value)) {
-    return <span className={`val ${value === null ? 'val-null' : ''}`}>{inlineText(value)}</span>
+    return <span className={`val ${value === null ? 'val-null' : ''}`}>{numText ?? inlineText(value)}</span>
   }
   const text = typeof value === 'string' ? value : pretty(value)
   return (

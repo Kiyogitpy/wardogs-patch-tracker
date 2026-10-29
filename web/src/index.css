@@ -632,3 +632,33 @@ main:focus {
   margin-top: 24px;
   font: 0.9rem var(--mono);
 }
+
+/* ---- small-screen safety: nothing may widen the page ---- */
+.skip-inline {
+  position: absolute;
+  left: -9999px;
+}
+.skip-inline:focus {
+  position: static;
+  display: inline-block;
+  margin-top: 12px;
+}
+.card-head > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.chip,
+.badge {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.entry-main,
+.entry h2 {
+  min-width: 0;
+}
+.state,
+.note,
+.crumbs,
+.meta {
+  overflow-wrap: anywhere;
+}
