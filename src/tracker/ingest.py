@@ -112,6 +112,9 @@ def _check_required(entry, where: str) -> None:
     for key in ("path", "name", "type"):
         if not isinstance(entry[key], str):
             raise ValueError(f"{where}: {key} must be a string")
+    for key in ("old_path", "paired_by", "note"):
+        if entry.get(key) is not None and not isinstance(entry[key], str):
+            raise ValueError(f"{where}: {key} must be a string or null")
     if entry["status"] not in ASSET_STATUSES:
         raise ValueError(f"{where}: status {str(entry['status'])[:40]!r} is not one of {', '.join(ASSET_STATUSES)}")
     exports = entry.get("exports")

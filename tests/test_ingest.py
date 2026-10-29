@@ -344,6 +344,11 @@ def counts_zero(db):
     (lambda e: e["noise"].update(dup_keys=None), "noise.dup_keys must be an integer"),
     (lambda e: e["noise"].update(dup_keys=1.0), "noise.dup_keys must be an integer"),
     (lambda e: e.update(name="a\ud800"), "DA_Truck.*lone surrogate"),
+    # These reached the database as TypeError/ProgrammingError (exit 3) or were stored unchecked.
+    (lambda e: e.update(old_path=["a"]), "old_path must be a string or null"),
+    (lambda e: e.update(old_path=7), "old_path must be a string or null"),
+    (lambda e: e.update(paired_by=3), "paired_by must be a string or null"),
+    (lambda e: e.update(note=["x"]), "note must be a string or null"),
 ])
 def test_wrong_types_and_enums_are_clear_value_errors(db, fixtures, tmp_path, edit, match):
     rejects(db, hostile_diff(fixtures, tmp_path, edit), match)
