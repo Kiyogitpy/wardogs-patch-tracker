@@ -251,7 +251,9 @@ Discord is contacted, so forged callbacks cannot occupy the exchange slots. Then
 reads `https://discord.com/api/users/@me`, upserts `app_user` by `discord_id` (refreshing `username`, `avatar`,
 `last_login_at`), creates a session, clears `oauth_state`, sets `session`, and 302s to `next`. Any failure (missing or
 wrong state, Discord error, `error=access_denied`) 302s to `/?signin=failed` without creating a session. Discord
-calls share one 8 s deadline (the token call and the profile call together; each call's timeout is what is left of it).
+calls share one 8 s wall-clock deadline (the token call and the profile call together): the exchange runs on a worker
+thread that is abandoned at the deadline, however slowly Discord drips its answer, and each response body is capped at
+64 KiB. The worker only returns data, so an abandoned one can never create a session.
 At most 4 code exchanges run at once; over that, the callback 302s to `/?signin=failed`
 at once. A Discord username with a control character (NUL, newline, ...) fails sign-in the same way. Each sign-in also
 deletes every expired session, not just the user's own, and a user keeps at most 10 sessions: a sign-in beyond that ends
@@ -259,12 +261,14 @@ the user's oldest ones.
 
 ### `POST /api/auth/logout`
 
-Deletes the session row, clears the cookie. 204, also when already signed out.
+Deletes the session row, clears the cookie. 204, also when already signed out. Rate-limited with the general API
+bucket, not the sign-in bucket (see Errors), so a user throttled on sign-in can still sign out.
 
 ### `POST /api/auth/logout-all`
 
 Deletes every session of the signed-in user (all browsers and devices), clears the cookie. 204. Needs a session (401
-`{"detail": "not signed in"}` otherwise) and the same `Origin` rule as every non-GET request (403 `bad origin`).
+`{"detail": "not signed in"}` otherwise) and the same `Origin` rule as every non-GET request (403 `bad origin`). Uses
+the general API rate-limit bucket like `logout`.
 
 ### `GET /api/me`
 
@@ -314,7 +318,16 @@ Body: `{"kind": "asset", "asset_path": "...", "webhook_url": "..."}`, or `{"kind
 
 ## Errors
 
-FastAPI defaults: 404 `{"detail": "..."}`, 422 validation body. Besides those, all under `/api`:
+404 is `{"detail": "..."}`. 422 is a validation error:
+`{"detail": [{"type": "...", "loc": ["body", "kind"], "msg": "..."}]}`. Each entry names where (`loc`) and why (`msg`);
+it never echoes the offending input, so a huge, NaN or unencodable value cannot make the error itself fail. Rejected
+with 422:
+
+- JSON bodies containing `NaN`, `Infinity` or `-Infinity` (`type: "json_invalid"`), and any malformed JSON.
+- Text that is not valid Unicode, such as a lone surrogate (`"a\ud800"` in JSON), in any free-text body field,
+  query or path parameter: `Value error, must be valid Unicode text`. The database cannot store it.
+
+Besides those, all under `/api`:
 
 - 413 `{"detail": "request body too large"}`: a body over 64 KiB, by `Content-Length` or by counting the streamed
   bytes of a chunked request (reading stops at the limit). This runs before authentication.
@@ -322,9 +335,21 @@ FastAPI defaults: 404 `{"detail": "..."}`, 422 validation body. Besides those, a
   memory, 10 requests a minute (burst 5) for `/api/auth/*` and 120 a minute (burst 60) for everything else. The IP is
   the connection's client address, which uvicorn's proxy-headers sets from the trusted proxy. An IPv4 address is its
   own bucket; an IPv6 address shares one bucket with its whole /64 (an IPv4-mapped IPv6 address counts as the IPv4
-  address).
+  address). `logout` and `logout-all` use the general bucket (120 a minute), not the `/api/auth/*` one.
+- Rate-limit design limits. The limiter is an in-process, best-effort guard, not a complete defence:
+  - Buckets are per IPv4 address or per IPv6 /64. An attacker who holds a larger IPv6 block (a /48 is 65,536 /64s)
+    has that many buckets, and one with many IPv4 addresses has one each.
+  - At most 10,000 buckets are kept. Beyond that the oldest are evicted first (FIFO by last use), so an attacker who
+    cycles through many addresses can push a real client's bucket out and reset it.
+  - A client address that is not an IP (for example `unknown`, when the server gives none) is used as given, so all
+    such clients share one bucket.
+  - Clients behind one NAT or CGNAT address share a bucket and can throttle each other.
+  - The buckets live in one process: they reset on restart and are not shared between workers.
+  - At scale, add rate limiting at the edge (reverse proxy, CDN or WAF), keyed on more than the client address.
 - 503 `{"detail": "query took too long, narrow the search"}`: a read query exceeded the API's 3 s `statement_timeout`.
 - 503 `{"detail": "the database is busy, try again shortly"}`: the database refused or lost the work (disk or shared
   memory full, too many connections, connection lost), or no pooled connection became free within 5 s. Retry later.
+  Both 503 kinds are logged at WARNING (`tracker.api`) with the exception class and SQLSTATE, never the SQL or its
+  parameters.
 - A trailing slash is not redirected: `/api/builds/` is a 404.
 
