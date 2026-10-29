@@ -1,0 +1,51 @@
+{
+ "area": "vehicles",
+ "assets": [
+  {
+   "name": "DA_Truck",
+   "path": "Game/Vehicles/DA_Truck.json",
+   "old_path": null,
+   "status": "modified",
+   "type": "VehicleData",
+   "paired_by": null,
+   "changes": [
+    {
+     "path": "Rows.Seats",
+     "op": "resequenced",
+     "before": [
+      "a",
+      "b"
+     ],
+     "after": [
+      "b",
+      "a"
+     ]
+    }
+   ],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   }
+  },
+  {
+   "name": "DA_Jeep",
+   "path": "Game/Vehicles/DA_Jeep.json",
+   "old_path": null,
+   "status": "modified",
+   "type": "VehicleData",
+   "paired_by": null,
+   "changes": [],
+   "noise": {
+    "renamed_keys": 4,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   },
+   "note": "hashed names only"
+  }
+ ]
+}

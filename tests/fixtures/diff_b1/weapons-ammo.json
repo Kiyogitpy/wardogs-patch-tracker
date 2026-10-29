@@ -1,0 +1,28 @@
+{
+ "area": "weapons-ammo",
+ "assets": [
+  {
+   "name": "AnimSet_Mosin",
+   "path": "Game/Old/AnimSet_Mosin.json",
+   "old_path": null,
+   "status": "modified",
+   "type": "BHAnimationSet",
+   "paired_by": null,
+   "changes": [
+    {
+     "path": "Properties.Rate",
+     "op": "changed",
+     "before": 1,
+     "after": 2
+    }
+   ],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   }
+  }
+ ]
+}

@@ -1,0 +1,57 @@
+{
+ "area": "weapons-ammo",
+ "assets": [
+  {
+   "name": "DA_OldGun",
+   "path": "Game/Weapons/DA_OldGun.json",
+   "old_path": null,
+   "status": "removed",
+   "type": "WeaponData",
+   "paired_by": null,
+   "changes": [
+    {
+     "path": "Type",
+     "op": "removed",
+     "before": "WeaponData",
+     "after": null
+    },
+    {
+     "path": "Name",
+     "op": "removed",
+     "before": "DA_OldGun",
+     "after": null
+    }
+   ],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   }
+  },
+  {
+   "name": "AnimSet_Mosin",
+   "path": "Game/New/AnimSet_Mosin.json",
+   "old_path": "Game/Old/AnimSet_Mosin.json",
+   "status": "moved",
+   "type": "BHAnimationSet",
+   "paired_by": "same-name",
+   "changes": [
+    {
+     "path": "Package",
+     "op": "changed",
+     "before": "/Old/AnimSet_Mosin",
+     "after": "/New/AnimSet_Mosin"
+    }
+   ],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   }
+  }
+ ]
+}

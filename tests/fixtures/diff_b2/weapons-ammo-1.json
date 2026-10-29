@@ -1,0 +1,51 @@
+{
+ "area": "weapons-ammo",
+ "assets": [
+  {
+   "name": "DA_Rifle",
+   "path": "Game/Weapons/DA_Rifle.json",
+   "old_path": null,
+   "status": "modified",
+   "type": "WeaponData",
+   "paired_by": null,
+   "changes": [
+    {
+     "path": "Properties.BaseDamage",
+     "op": "changed",
+     "before": 40,
+     "after": 45
+    },
+    {
+     "path": "Properties.Tags[2]",
+     "op": "added",
+     "before": null,
+     "after": "Tag.X"
+    }
+   ],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   }
+  },
+  {
+   "name": "DA_Pistol",
+   "path": "Game/Weapons/DA_Pistol.json",
+   "old_path": null,
+   "status": "added",
+   "type": "WeaponData",
+   "paired_by": null,
+   "changes": [],
+   "noise": {
+    "renamed_keys": 0,
+    "ref_shifts": 0,
+    "dup_keys": 0,
+    "swapped_keys": 0,
+    "type_reinterpret": 0
+   },
+   "exports": 3
+  }
+ ]
+}
