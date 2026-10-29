@@ -189,3 +189,136 @@ def test_cli_reports_a_bad_diff_without_a_traceback(db, fixtures, tmp_path, monk
     set_file(diff, "../nope.json")
     assert cli.main(["ingest", "--label", "b2", "--diff", str(diff)]) == 1
     assert "leaves the diff directory" in capsys.readouterr().err
+
+
+# ---------- malformed diffs and files that are not regular files ----------
+
+def edit_json(diff, name, edit):
+    data = json.loads((diff / name).read_text(encoding="utf-8"))
+    edit(data)
+    (diff / name).write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_area_file_that_is_a_directory_is_a_clear_error(db, fixtures, tmp_path):
+    diff = hostile_diff(fixtures, tmp_path)
+    (diff / "subdir").mkdir()
+    set_file(diff, "subdir")
+    rejects(db, diff, "area weapons-ammo: file 'subdir' is not a regular file")
+
+
+def test_area_file_that_is_missing_is_a_clear_error(db, fixtures, tmp_path):
+    diff = hostile_diff(fixtures, tmp_path)
+    set_file(diff, "nope.json")
+    rejects(db, diff, "area weapons-ammo: file 'nope.json' does not exist")
+    set_file(diff, ["vehicles.json", "nope.json"])
+    rejects(db, diff, "file 'nope.json' does not exist")
+
+
+def test_index_json_missing_or_a_directory_is_a_clear_error(db, fixtures, tmp_path):
+    diff = hostile_diff(fixtures, tmp_path)
+    (diff / "index.json").unlink()
+    rejects(db, diff, "index.json: does not exist")
+    (diff / "index.json").mkdir()
+    rejects(db, diff, "index.json: is not a regular file")
+
+
+@pytest.mark.parametrize("name, edit, match", [
+    ("index.json", lambda d: d.pop("areas"), "index.json: missing 'areas'"),
+    ("index.json", lambda d: d.pop("totals"), "index.json: missing 'totals'"),
+    ("index.json", lambda d: d["areas"][0].pop("id"), "missing 'id'"),
+    ("index.json", lambda d: d["areas"][0].pop("file"), "missing 'file'"),
+    ("index.json", lambda d: d["areas"][0].pop("title"), "missing 'title'"),
+    ("index.json", lambda d: d["areas"][0].pop("counts"), "missing 'counts'"),
+    ("index.json", lambda d: d.update(areas={}), "areas: expected list"),
+    ("vehicles.json", lambda d: d.pop("assets"), "vehicles.json: missing 'assets'"),
+    ("vehicles.json", lambda d: d.update(assets=None), "assets: expected list"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("path"), "missing 'path'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("name"), "missing 'name'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("type"), "missing 'type'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("status"), "missing 'status'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("noise"), "missing 'noise'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("changes"), "missing 'changes'"),
+    ("vehicles.json", lambda d: d["assets"][0].pop("old_path"), "missing 'old_path'"),
+    ("vehicles.json", lambda d: d["assets"][0]["noise"].pop("dup_keys"), "missing 'dup_keys'"),
+    ("vehicles.json", lambda d: d["assets"][0]["changes"][0].pop("op"), "missing 'op'"),
+    ("vehicles.json", lambda d: d["assets"][0]["changes"][0].pop("before"), "missing 'before'"),
+    ("vehicles.json", lambda d: d["assets"].append("not an object"), "expected dict"),
+])
+def test_missing_required_keys_are_value_errors_not_key_errors(db, fixtures, tmp_path, name, edit, match):
+    diff = hostile_diff(fixtures, tmp_path)
+    edit_json(diff, name, edit)
+    rejects(db, diff, match)
+
+
+def test_incomplete_manifest_is_a_value_error(db, fixtures):
+    with pytest.raises(ValueError, match="manifest: missing 'fingerprint'"):
+        with db.begin() as conn:
+            ingest(conn, fixtures / "diff_b2", "b2", manifest={"steam": {"buildid": "1"}})
+    with pytest.raises(ValueError, match="manifest.steam: missing 'buildid'"):
+        with db.begin() as conn:
+            ingest(conn, fixtures / "diff_b2", "b2", manifest={"steam": {}, "fingerprint": "f"})
+
+
+def test_file_swapped_for_a_symlink_after_the_check_is_still_refused(db, fixtures, tmp_path, monkeypatch):
+    """The path was checked, then (here: exactly when it is opened) replaced by a link out of the directory."""
+    from tracker import ingest as ingest_mod
+    diff = hostile_diff(fixtures, tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"assets": []}), encoding="utf-8")
+    real_open = open
+
+    def swapping_open(path, *args, **kwargs):
+        if str(path).endswith("vehicles.json"):
+            (diff / "vehicles.json").unlink()
+            try:
+                (diff / "vehicles.json").symlink_to(outside)
+            except OSError:
+                pytest.skip("symlinks need a privilege on this machine")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ingest_mod, "open", swapping_open, raising=False)
+    rejects(db, diff, "leaves the diff directory")
+
+
+def run_ingest_cli(db, monkeypatch, diff, *extra):
+    monkeypatch.setenv("DATABASE_URL", db.url.render_as_string(hide_password=False))
+    return cli.main(["ingest", "--label", "b2", "--diff", str(diff), *extra])
+
+
+def test_cli_reports_bad_files_and_keys_without_a_traceback(db, fixtures, tmp_path, monkeypatch, capsys):
+    diff = hostile_diff(fixtures, tmp_path)
+    (diff / "subdir").mkdir()
+    set_file(diff, "subdir")
+    assert run_ingest_cli(db, monkeypatch, diff) == 1
+    err = capsys.readouterr().err
+    assert "not a regular file" in err and "Traceback" not in err
+
+    edit_json(diff, "index.json", lambda d: d.pop("areas"))
+    assert run_ingest_cli(db, monkeypatch, diff) == 1
+    err = capsys.readouterr().err
+    assert "missing 'areas'" in err and "Traceback" not in err
+
+    assert run_ingest_cli(db, monkeypatch, tmp_path / "no-such-dir") == 1
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_cli_reports_a_bad_manifest_without_a_traceback(db, fixtures, tmp_path, monkeypatch, capsys):
+    assert run_ingest_cli(db, monkeypatch, fixtures / "diff_b2", "--manifest", str(tmp_path / "nope.json")) == 1
+    assert "manifest" in capsys.readouterr().err
+    bad = tmp_path / "manifest.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert run_ingest_cli(db, monkeypatch, fixtures / "diff_b2", "--manifest", str(bad)) == 1
+    assert "manifest" in capsys.readouterr().err
+
+
+def test_cli_disposes_its_engine(db, fixtures, monkeypatch):
+    engines = []
+    real = cli.create_engine
+
+    def spy(*args, **kwargs):
+        engines.append(real(*args, **kwargs))
+        return engines[-1]
+
+    monkeypatch.setattr(cli, "create_engine", spy)
+    assert run_ingest_cli(db, monkeypatch, fixtures / "diff_b2") == 0
+    assert len(engines) == 1 and engines[0].pool.checkedin() == 0 and engines[0].pool.checkedout() == 0

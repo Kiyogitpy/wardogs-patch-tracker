@@ -1,5 +1,7 @@
 """Body cap, rate limiting and statement timeout in front of the API."""
+import psycopg.errors
 import pytest
+import sqlalchemy.exc
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -110,3 +112,83 @@ def test_slow_query_is_503_not_500(client, monkeypatch):
     finally:
         api.app.router.routes[:] = [x for x in api.app.router.routes if getattr(x, "path", "") != "/api/_slow"]
     assert r.status_code == 503 and r.json() == {"detail": "query took too long, narrow the search"}
+
+
+# --- database errors under load ---------------------------------------------------------------------------------
+
+BUSY = {"detail": "the database is busy, try again shortly"}
+SLOW = {"detail": "query took too long, narrow the search"}
+
+
+class BrokenEngine:
+    def __init__(self, error):
+        self.error = error
+
+    def connect(self):
+        raise self.error
+
+
+@pytest.mark.parametrize("orig, body", [
+    (psycopg.errors.DiskFull("could not resize shared memory segment"), BUSY),
+    (psycopg.errors.TooManyConnections("sorry, too many clients already"), BUSY),
+    (psycopg.OperationalError("server closed the connection unexpectedly"), BUSY),
+    (psycopg.errors.QueryCanceled("canceling statement due to statement timeout"), SLOW),
+])
+def test_database_operational_errors_are_503(orig, body, monkeypatch):
+    error = sqlalchemy.exc.OperationalError("SELECT 1", {}, orig)
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    r = TestClient(api.app, raise_server_exceptions=False).get("/api/builds")
+    assert r.status_code == 503 and r.json() == body
+
+
+def test_pool_timeout_is_503(monkeypatch):
+    error = sqlalchemy.exc.TimeoutError("QueuePool limit of size 5 overflow 10 reached")
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    r = TestClient(api.app, raise_server_exceptions=False).get("/api/builds")
+    assert r.status_code == 503 and r.json() == BUSY
+
+
+def test_other_database_errors_stay_500(monkeypatch):
+    error = sqlalchemy.exc.ProgrammingError("SELECT 1", {}, psycopg.errors.UndefinedTable("no such table"))
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    assert TestClient(api.app, raise_server_exceptions=False).get("/api/builds").status_code == 500
+
+
+def test_pool_waits_at_most_5_seconds(client):
+    assert api.get_engine().pool.timeout() == 5
+
+
+# --- rate limit buckets -----------------------------------------------------------------------------------------
+
+def _statuses(monkeypatch, *ips):
+    import asyncio
+    monkeypatch.setattr(api, "RATE_API", (60, 2))  # burst 2, a token a second
+
+    async def inner(scope, receive, send):
+        await api._reply(send, 200, "ok")
+
+    async def run():
+        out = []
+        for ip in ips:
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            await api.Guard(inner)({"type": "http", "path": "/api/builds", "headers": [], "client": (ip, 1)}, None, send)
+            out.append(sent[0]["status"])
+        return out
+
+    return asyncio.run(run())
+
+
+def test_ipv6_addresses_in_one_slash_64_share_a_bucket(monkeypatch):
+    got = _statuses(monkeypatch, "2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2:1:2:3:4",
+                    "2001:db8:1:3::1")
+    assert got == [200, 200, 429, 200]  # the third is in the first one's /64; the fourth is in another
+    assert ("2001:db8:1:2::/64", "api") in api._buckets
+
+
+def test_ipv4_is_limited_per_address_and_mapped_ipv6_is_ipv4(monkeypatch):
+    got = _statuses(monkeypatch, "192.0.2.1", "192.0.2.2", "192.0.2.1", "::ffff:192.0.2.1", "192.0.2.2")
+    assert got == [200, 200, 200, 429, 200]

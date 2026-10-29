@@ -9,4 +9,5 @@ WEBHOOK_RE = re.compile(
 def canonical(url: str) -> str | None:
     """The webhook on discord.com (aliases map to it, so duplicates are caught), or None if it is not valid."""
     m = WEBHOOK_RE.fullmatch(url)
-    return f"https://discord.com/api/webhooks/{m[1]}/{m[2]}" if m else None
+    # int() drops leading zeros: /webhooks/0123/t and /webhooks/123/t are the same webhook.
+    return f"https://discord.com/api/webhooks/{int(m[1])}/{m[2]}" if m else None

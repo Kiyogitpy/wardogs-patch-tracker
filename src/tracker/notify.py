@@ -9,7 +9,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from tracker.api import NEWEST_FIRST, STATUS_ORDER, _contains
@@ -29,17 +29,24 @@ MAX_FOOTER = 2048
 MAX_URL = 2048
 MAX_EMBED = 6000  # Discord counts title + description + footer text
 HUGE = 1e300  # numbers at or beyond this are shown as plain values, not subtracted
-MAX_LINE = 400  # keeps ten lines plus the "and N more" line near the description limit
 MAX_ERROR = 300
 ATTEMPTS = 3
 BACKOFF = (1, 4)
 RETRY_AFTER_CAP = 30
 TIMEOUT = 10
+BUDGET = 60  # seconds one subscription may take over all its attempts, waits included
+MAX_RATE_SLEEP = 40  # of which at most this many may be spent waiting out 429s
+STATEMENT_TIMEOUT_MS = 60_000  # per statement on the notify engine
 GONE = (401, 403, 404)
 
 
 class UnknownBuild(Exception):
     pass
+
+
+def make_engine(url: str):
+    """The engine a notify run uses: every statement is bounded, so a stuck query cannot hang the run."""
+    return create_engine(url, connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"})
 
 
 # ---------- value formatting (mirrors web/src/format.ts) ----------
@@ -88,8 +95,21 @@ def _delta(before, after) -> str | None:
     return f"({text}, {pct})"
 
 
+def u16(text: str) -> int:
+    """Length in UTF-16 code units, which is how Discord counts every embed limit (an emoji is 2)."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def _cut(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    """At most `limit` UTF-16 units, ending in "…" when cut; a surrogate pair is never split."""
+    if u16(text) <= limit:
+        return text
+    used = 0
+    for i, c in enumerate(text):
+        used += 2 if ord(c) > 0xFFFF else 1
+        if used > limit - 1:
+            return text[:i] + "…"
+    return text
 
 
 # ---------- Discord Markdown safety ----------
@@ -100,8 +120,21 @@ _SPECIAL = re.compile(r"([\\*_~|>\[\]()#<`])")
 _LIST_START = re.compile(r"^(\s*)(?:([-+])|(\d+)\.)")
 
 
+ZWSP = "\N{ZERO WIDTH SPACE}"  # zero-width space: the one format character we add ourselves, after the game text is cleaned
+_DOT = re.compile(r"(?<=\w)[.\N{IDEOGRAPHIC FULL STOP}\N{FULLWIDTH FULL STOP}\N{HALFWIDTH IDEOGRAPHIC FULL STOP}](?=\w)")  # ASCII, ideographic, fullwidth and halfwidth dots
+
+
 def _oneline(text: str) -> str:
-    return "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in text)
+    """One line: line breaks and control characters become spaces; format characters (category Cf: bidi
+    overrides and isolates, joiners, BOM, soft hyphen) are dropped."""
+    out = []
+    for c in text:
+        category = unicodedata.category(c)
+        if category in ("Cc", "Zl", "Zp"):
+            out.append(" ")
+        elif category != "Cf":
+            out.append(c)
+    return "".join(out)
 
 
 def md(text: str, limit: int = 10_000) -> str:
@@ -109,7 +142,8 @@ def md(text: str, limit: int = 10_000) -> str:
     syntax, and no clickable bare URL."""
     text = _SPECIAL.sub(r"\\\1", _cut(_oneline(text), limit))
     text = _LIST_START.sub(lambda m: m[1] + (f"\\{m[2]}" if m[2] else f"{m[3]}\\."), text)
-    return text.replace("://", ":\\/\\/")
+    text = text.replace("://", ":\\/\\/")
+    return _DOT.sub(lambda m: m[0] + ZWSP, text)  # evil.com, discord.gg/x: not a domain Discord will link
 
 
 def code(text: str, limit: int = MAX_VALUE) -> str:
@@ -148,7 +182,7 @@ def description(lines: list[str], total: int, link: str, limit: int = MAX_DESCRI
     while True:
         more = total - len(shown)
         text = "\n".join(shown + ([f"and {more} more: {link}"] if more > 0 else []))
-        if len(text) <= limit or not shown:
+        if u16(text) <= limit or not shown:
             return _cut(text, limit)
         shown.pop()
 
@@ -157,7 +191,7 @@ def _embed(title: str, url: str, lines: list[str], total: int, footer: str, fall
     title, footer = _cut(title, MAX_TITLE), _cut(_oneline(footer), MAX_FOOTER)
     if len(url) > MAX_URL:  # a very long asset path: link to the build page instead
         url = fallback
-    budget = min(MAX_DESCRIPTION, MAX_EMBED - len(title) - len(footer))
+    budget = min(MAX_DESCRIPTION, MAX_EMBED - u16(title) - u16(footer))
     return {
         "username": "Wardogs Patch Tracker",
         "allowed_mentions": {"parse": []},
@@ -255,13 +289,21 @@ def _retry_after(response: httpx.Response) -> float:
     return min(max(value, 0.0), RETRY_AFTER_CAP)
 
 
-def send(client: httpx.Client, webhook: str, body: dict, sleep) -> tuple[str, int, str | None, bool]:
-    """POST with the spec's retry rules. Returns (status, tries, last_error, webhook_gone)."""
+def send(client: httpx.Client, webhook: str, body: dict, sleep, clock=time.monotonic) -> tuple[str, int, str | None, bool]:
+    """POST with the spec's retry rules inside a time budget of BUDGET seconds, waits included, of which at most
+    MAX_RATE_SLEEP go to 429 waits. When the next wait would not fit, it stops: "time budget exhausted".
+    Returns (status, tries, last_error, webhook_gone)."""
+    deadline = clock() + BUDGET
+    waited_429 = 0.0
     error = None
     for attempt in range(1, ATTEMPTS + 1):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return "failed", attempt - 1, "time budget exhausted", False
         delay = BACKOFF[min(attempt - 1, len(BACKOFF) - 1)]
+        rate_limited = False
         try:
-            response = client.post(webhook, json=body, timeout=TIMEOUT)
+            response = client.post(webhook, json=body, timeout=min(TIMEOUT, remaining))
         except httpx.HTTPError as e:
             error = f"network error: {type(e).__name__}"  # str(e) can carry the request URL
         else:
@@ -272,11 +314,14 @@ def send(client: httpx.Client, webhook: str, body: dict, sleep) -> tuple[str, in
             if code in GONE:
                 return "failed", attempt, error, True
             if code == 429:
-                delay = _retry_after(response)
+                delay, rate_limited = _retry_after(response), True
             elif code < 500:
                 return "failed", attempt, error, False
         if attempt < ATTEMPTS:
+            if clock() + delay >= deadline or (rate_limited and waited_429 + delay > MAX_RATE_SLEEP):
+                return "failed", attempt, "time budget exhausted", False
             sleep(delay)
+            waited_429 += delay if rate_limited else 0
     return "failed", ATTEMPTS, error, False
 
 
@@ -295,7 +340,7 @@ def _record(engine, sub_id: int, build_id: int, status: str, tries: int, error: 
 
 
 def notify(engine, label: str, public_origin: str, client: httpx.Client | None = None, dry_run: bool = False,
-           sleep=time.sleep) -> dict:
+           sleep=time.sleep, clock=time.monotonic) -> dict:
     """Send every due message for build `label`. Raises UnknownBuild if it is not ingested."""
     origin = public_origin.rstrip("/")
     with engine.connect() as conn:
@@ -335,7 +380,7 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
                 if not WEBHOOK_RE.fullmatch(sub.webhook_url):  # the stored value is re-checked before it is used
                     status, tries, error, gone = "failed", 0, "invalid webhook", True
                 else:
-                    status, tries, error, gone = send(client, sub.webhook_url, body, sleep)
+                    status, tries, error, gone = send(client, sub.webhook_url, body, sleep, clock)
             except Exception as e:
                 log.error("subscription %s: sending failed: %s", sub.id, type(e).__name__)
                 status, tries, error, gone = "failed", 0, f"internal error: {type(e).__name__}", False

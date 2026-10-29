@@ -138,3 +138,8 @@ def test_name_order_is_by_code_point(client, db):
 ])
 def test_like_wildcards_are_literal(client, params, total):
     assert client.get(W, params=params).json()["total"] == total
+
+
+def test_trailing_slash_is_404_not_a_redirect_built_from_the_host_header(client):
+    r = client.get("/api/builds/", headers={"Host": "evil.example"}, follow_redirects=False)
+    assert r.status_code == 404 and "location" not in r.headers

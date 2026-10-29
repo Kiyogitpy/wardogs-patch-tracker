@@ -9,7 +9,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 
 from tracker.ingest import TotalsMismatch, ingest
-from tracker.notify import UnknownBuild, notify
+from tracker.notify import UnknownBuild, make_engine, notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,9 +31,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("DATABASE_URL is not set")
     if args.command == "notify":
         return _notify(parser, url, args)
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None
     try:
-        with create_engine(url).begin() as conn:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None
+    except (OSError, ValueError) as e:
+        print(f"tracker: cannot read the manifest {args.manifest}: {e}", file=sys.stderr)
+        return 1
+    engine = create_engine(url)
+    try:
+        with engine.begin() as conn:
             result = ingest(conn, args.diff, args.label, args.prev_label, manifest, args.released)
     except TotalsMismatch as e:
         print(f"tracker: totals do not match index.json, nothing was written: {e}", file=sys.stderr)
@@ -41,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:  # a bad diff (also bad JSON): nothing was written
         print(f"tracker: bad diff, nothing was written: {e}", file=sys.stderr)
         return 1
+    finally:
+        engine.dispose()
     print(f"ingested {args.label}: {result['assets']} assets, {result['changes']} changes; totals match index.json")
     return 0
 
@@ -51,7 +58,7 @@ def _notify(parser, url: str, args) -> int:
         parser.error("PUBLIC_ORIGIN is not set")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every request URL, which is the webhook secret
-    engine = create_engine(url)
+    engine = make_engine(url)
     try:
         result = notify(engine, args.label, origin, dry_run=args.dry_run)
     except UnknownBuild:

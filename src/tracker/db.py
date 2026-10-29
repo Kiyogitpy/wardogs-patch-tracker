@@ -101,6 +101,15 @@ session = Table(
     Column("user_id", Integer, ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("expires_at", DateTime(timezone=True), nullable=False),
+    Index("ix_session_expires_at", "expires_at"),  # the expired-session purge at login
+)
+
+# One row per sign-in in progress: the callback must consume it, once, before it contacts Discord.
+oauth_state = Table(
+    "oauth_state", metadata,
+    Column("state_hash", Text, primary_key=True),  # SHA-256 of the state, like sessions
+    Column("next", Text, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
 )
 
 subscription = Table(
