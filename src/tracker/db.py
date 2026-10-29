@@ -75,6 +75,7 @@ build_area = Table(
     "build_area", metadata,
     Column("build_id", Integer, ForeignKey("build.id", ondelete="CASCADE"), primary_key=True),
     Column("area", Text, primary_key=True),
+    Column("position", Integer, nullable=False),  # order in index.json
     Column("title", Text, nullable=False),
     Column("counts", JSONB, nullable=False),
 )

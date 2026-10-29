@@ -78,7 +78,8 @@ def ingest(conn: Connection, diff_dir: Path, label: str, prev_label: str | None 
         {"old_path": e["old_path"], "build_id": build_id, "asset_id": ids[e["path"]]} for _, e in entries if e["old_path"]
     ])
     _insert_many(conn, insert(build_area), [
-        {"build_id": build_id, "area": a["id"], "title": a["title"], "counts": a["counts"]} for a in index["areas"]
+        {"build_id": build_id, "area": a["id"], "position": i, "title": a["title"], "counts": a["counts"]}
+        for i, a in enumerate(index["areas"])
     ])
 
     check_totals(conn, build_id, index)
