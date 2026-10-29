@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ApiError } from './api'
 
 export type Remote<T> =
@@ -44,4 +44,25 @@ export function useTitle(title: string) {
   useEffect(() => {
     document.title = title ? `${title} · Wardogs Patch Tracker` : 'Wardogs Patch Tracker'
   }, [title])
+}
+
+/** A text input whose debounced value is written to the URL; follows external URL changes (back button). */
+export function useUrlText(urlValue: string, commit: (v: string) => void) {
+  const [text, setText] = useState(urlValue)
+  const debounced = useDebounced(text)
+  const lastCommitted = useRef(urlValue)
+  useEffect(() => {
+    if (debounced !== lastCommitted.current) {
+      lastCommitted.current = debounced
+      commit(debounced)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debounced])
+  useEffect(() => {
+    if (urlValue !== lastCommitted.current) {
+      lastCommitted.current = urlValue
+      setText(urlValue)
+    }
+  }, [urlValue])
+  return [text, setText] as const
 }
