@@ -109,9 +109,27 @@ def test_json_values_returned_as_stored(client, db):
     assert '"before":60.0' in r.text and r.json()["items"][0]["changes"][0]["after"] == 45
 
 
-@pytest.mark.parametrize("params", [{"status": "bogus"}, {"limit": 0}, {"limit": 201}, {"offset": -1}, {"limit": "x"}])
+@pytest.mark.parametrize("params", [
+    {"status": "bogus"}, {"limit": 0}, {"limit": 201}, {"offset": -1}, {"limit": "x"},
+    # Postgres rejects NUL in text and offsets past bigint; these were 500s.
+    {"q": "a\x00"}, {"field": "\x00"}, {"area": "\x00"}, {"type": "\x00"}, {"q": "x" * 201},
+    {"offset": 1_000_001}, {"offset": 10**20},
+])
 def test_bad_params_are_422(client, params):
     assert client.get(W, params=params).status_code == 422
+
+
+@pytest.mark.parametrize("path", ["/api/builds/b%00", "/api/builds/b%00/assets"])
+def test_nul_in_label_is_404(client, path):
+    assert client.get(path).status_code == 404
+
+
+def test_name_order_is_by_code_point(client, db):
+    # Collation-aware ordering ignores the underscore and would put DA_TruckA first.
+    with db.begin() as conn:
+        conn.execute(update(api.asset).where(api.asset.c.name == "DA_Jeep").values(name="DA_Truck_B"))
+        conn.execute(update(api.asset).where(api.asset.c.name == "DA_Truck").values(name="DA_TruckA"))
+    assert names(client.get(W, params={"area": "vehicles"})) == ["DA_Truck_B", "DA_TruckA"]
 
 
 @pytest.mark.parametrize("params, total", [

@@ -11,6 +11,9 @@ from tracker.db import asset, asset_alias, asset_status, build, build_area, chan
 
 COUNT_KEYS = ("added", "removed", "modified", "moved", "property_changes", "removed_values")
 
+# A text filter. NUL is rejected here because Postgres text cannot hold it (the driver would raise a 500).
+Filter = Annotated[str | None, Query(max_length=200, pattern=r"^[^\x00]*$")]
+
 app = FastAPI(title="Wardogs patch tracker")
 
 
@@ -44,7 +47,8 @@ def _select_build():
 
 
 def _get_build(conn, label: str):
-    row = conn.execute(_select_build().where(build.c.label == label)).first()
+    # Postgres text cannot hold NUL, so no label containing one exists.
+    row = None if "\x00" in label else conn.execute(_select_build().where(build.c.label == label)).first()
     if row is None:
         raise HTTPException(404, "build not found")
     return row
@@ -73,7 +77,7 @@ def get_build(label: str):
         n = func.count().label("n")
         types = conn.execute(
             select(asset.c.type, n).select_from(asset_status.join(asset, asset.c.id == asset_status.c.asset_id))
-            .where(asset_status.c.build_id == row.id).group_by(asset.c.type).order_by(n.desc(), asset.c.type)
+            .where(asset_status.c.build_id == row.id).group_by(asset.c.type).order_by(n.desc(), asset.c.type.collate("C"))
         ).all()
     return {
         **_build_json(row, [a.counts for a in areas]),
@@ -85,13 +89,13 @@ def get_build(label: str):
 @app.get("/api/builds/{label}/assets")
 def list_assets(
     label: str,
-    area: str | None = None,
+    area: Filter = None,
     status: Literal["added", "removed", "modified", "moved"] | None = None,
-    type: str | None = None,
-    q: str | None = None,
-    field: str | None = None,
+    type: Filter = None,
+    q: Filter = None,
+    field: Filter = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
 ):
     with get_engine().connect() as conn:
         build_id = _get_build(conn, label).id
@@ -119,7 +123,8 @@ def list_assets(
                    asset_status.c.noise)
             .select_from(joined.outerjoin(asset_alias, (asset_alias.c.build_id == asset_status.c.build_id)
                                           & (asset_alias.c.asset_id == asset_status.c.asset_id)))
-            .where(*where).order_by(status_order, func.lower(asset.c.name), asset.c.path)
+            # "C" collation: code-point order, independent of the server locale (which ignores punctuation).
+            .where(*where).order_by(status_order, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C"))
             .limit(limit).offset(offset)
         ).all()
 

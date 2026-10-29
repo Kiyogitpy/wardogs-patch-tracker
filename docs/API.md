@@ -7,7 +7,9 @@ Only builds with an ingested diff (`ingested_at` not null) are listed or served.
 another build's `--from` returns 404.
 
 Dates are ISO 8601 strings (`released_at`: `YYYY-MM-DD`; `ingested_at`: full timestamp with offset). `before`/`after`
-are the stored JSON values exactly: number, string, boolean, null, array or object.
+are the stored JSON values: number, string, boolean, null, array or object. They come from Postgres `jsonb`, which
+keeps numbers exactly (`60.0` stays `60.0`) but drops the sign of zero (`-0.0` → `0.0`) and reorders object keys
+(shorter keys first, then by bytes).
 
 ## `GET /api/builds`
 
@@ -49,7 +51,7 @@ One build plus what the diff view needs to build its filters. 404 `{"detail": "b
 ```
 
 `areas` keeps the order of `index.json` (`build_area.position`). `types` is every asset type in the build with its asset count, by count
-descending, then type ascending.
+descending, then type ascending by code point.
 
 ## `GET /api/builds/{label}/assets`
 
@@ -63,9 +65,12 @@ The assets of one build's diff with their changes, paginated by asset. 404 as ab
 | `q` | case-insensitive substring of the asset name or path |
 | `field` | case-insensitive substring of a change's `field_path`. Only assets with at least one matching change are returned, and `changes` holds only the matching ones |
 | `limit` | 1–200, default 50; 422 outside the range |
-| `offset` | ≥ 0, default 0 |
+| `offset` | 0–1,000,000, default 0; 422 outside the range |
 
-Order: status (`modified`, `moved`, `added`, `removed`, as `season_diff.py`), then lower-case name, then path.
+`area`, `type`, `q` and `field` are at most 200 characters and may not contain NUL; 422 otherwise.
+
+Order: status (`modified`, `moved`, `added`, `removed`, as `season_diff.py`), then lower-case name, then path, both
+compared by code point (`_` sorts before letters).
 Changes inside an asset keep ingest order (`change.id`).
 
 ```json
