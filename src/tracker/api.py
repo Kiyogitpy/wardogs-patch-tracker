@@ -13,6 +13,11 @@ COUNT_KEYS = ("added", "removed", "modified", "moved", "property_changes", "remo
 
 # A text filter. NUL is rejected here because Postgres text cannot hold it (the driver would raise a 500).
 Filter = Annotated[str | None, Query(max_length=200, pattern=r"^[^\x00]*$")]
+Limit = Annotated[int, Query(ge=1, le=200)]
+Offset = Annotated[int, Query(ge=0, le=1_000_000)]
+
+# Build order, defined once: newest first. Chronological is this order reversed (done in Python).
+NEWEST_FIRST = (build.c.released_at.desc().nulls_last(), build.c.id.desc())
 
 app = FastAPI(title="Wardogs patch tracker")
 
@@ -58,7 +63,7 @@ def _get_build(conn, label: str):
 def list_builds():
     with get_engine().connect() as conn:
         rows = conn.execute(
-            _select_build().order_by(build.c.released_at.desc().nulls_last(), build.c.id.desc())
+            _select_build().order_by(*NEWEST_FIRST)
         ).all()
         counts = defaultdict(list)
         for build_id, c in conn.execute(select(build_area.c.build_id, build_area.c.counts)):
@@ -94,8 +99,8 @@ def list_assets(
     type: Filter = None,
     q: Filter = None,
     field: Filter = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    limit: Limit = 50,
+    offset: Offset = 0,
 ):
     with get_engine().connect() as conn:
         build_id = _get_build(conn, label).id
@@ -145,6 +150,134 @@ def list_assets(
             {"path": r.path, "name": r.name, "type": r.type, "area": r.area, "status": r.status,
              "old_path": r.old_path, "paired_by": r.paired_by, "exports": r.exports, "note": r.note,
              "noise": r.noise, "changes": changes[r.id]}
+            for r in rows
+        ],
+    }
+
+
+def _in_ingested_build(asset_id_column):
+    """EXISTS: the asset is listed by the diff of at least one ingested build."""
+    return exists().where(asset_status.c.asset_id == asset_id_column, asset_status.c.build_id == build.c.id,
+                          build.c.ingested_at.is_not(None))
+
+
+@app.get("/api/assets")
+def search_assets(q: Filter = None, limit: Limit = 50, offset: Offset = 0):
+    where = [_in_ingested_build(asset.c.id)]
+    if q:
+        where.append(_contains(asset.c.name, q) | _contains(asset.c.path, q)
+                     | exists().where(asset_alias.c.asset_id == asset.c.id, _contains(asset_alias.c.old_path, q)))
+    with get_engine().connect() as conn:
+        total = conn.execute(select(func.count()).select_from(asset).where(*where)).scalar_one()
+        rows = conn.execute(
+            select(asset.c.id, asset.c.path, asset.c.name, asset.c.type).where(*where)
+            .order_by(func.lower(asset.c.name).collate("C"), asset.c.path.collate("C")).limit(limit).offset(offset)
+        ).all()
+        listed = defaultdict(list)  # asset id -> the ingested builds listing it, newest first
+        if rows:
+            for r in conn.execute(
+                select(asset_status.c.asset_id, build.c.label, asset_status.c.status, asset_status.c.area)
+                .select_from(asset_status.join(build, build.c.id == asset_status.c.build_id))
+                .where(asset_status.c.asset_id.in_([r.id for r in rows]), build.c.ingested_at.is_not(None))
+                .order_by(*NEWEST_FIRST)
+            ):
+                listed[r.asset_id].append(r)
+    return {
+        "total": total,
+        "items": [
+            {"path": r.path, "name": r.name, "type": r.type, "builds": len(listed[r.id]),
+             "last": {"label": listed[r.id][0].label, "status": listed[r.id][0].status, "area": listed[r.id][0].area}}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/asset")
+def get_asset(path: Annotated[str, Query(max_length=1000, pattern=r"^[^\x00]*$")], field: Filter = None):
+    with get_engine().connect() as conn:
+        row = conn.execute(select(asset).where(asset.c.path == path, _in_ingested_build(asset.c.id))).first()
+        if row is None:
+            # A former path: the asset that moved from it most recently.
+            row = conn.execute(
+                select(asset).select_from(asset_alias.join(asset, asset.c.id == asset_alias.c.asset_id)
+                                          .join(build, build.c.id == asset_alias.c.build_id))
+                .where(asset_alias.c.old_path == path, build.c.ingested_at.is_not(None))
+                .order_by(*NEWEST_FIRST).limit(1)
+            ).first()
+        if row is None:
+            raise HTTPException(404, "asset not found")
+
+        prev = build.alias("prev")
+        aliases = conn.execute(
+            select(asset_alias.c.old_path, build.c.label)
+            .select_from(asset_alias.join(build, build.c.id == asset_alias.c.build_id))
+            .where(asset_alias.c.asset_id == row.id, build.c.ingested_at.is_not(None)).order_by(*NEWEST_FIRST)
+        ).all()
+        history = conn.execute(
+            select(build.c.id.label("build_id"), build.c.label, prev.c.label.label("prev_label"), build.c.released_at,
+                   asset_status.c.area, asset_status.c.status, asset_status.c.paired_by, asset_status.c.exports,
+                   asset_status.c.note, asset_status.c.noise)
+            .select_from(asset_status.join(build, build.c.id == asset_status.c.build_id)
+                         .outerjoin(prev, prev.c.id == build.c.prev_build_id))
+            .where(asset_status.c.asset_id == row.id, build.c.ingested_at.is_not(None)).order_by(*NEWEST_FIRST)
+        ).all()
+        query = (select(change.c.build_id, change.c.field_path, change.c.op, change.c.before, change.c.after)
+                 .where(change.c.asset_id == row.id).order_by(change.c.id))
+        if field:
+            query = query.where(_contains(change.c.field_path, field))
+        changes = defaultdict(list)
+        for c in conn.execute(query):
+            changes[c.build_id].append({"field_path": c.field_path, "op": c.op, "before": c.before, "after": c.after})
+
+    return {
+        "path": row.path, "name": row.name, "type": row.type,
+        "aliases": [{"old_path": a.old_path, "build": a.label} for a in reversed(aliases)],
+        "history": [
+            {"build": {"label": h.label, "prev_label": h.prev_label,
+                       "released_at": h.released_at.isoformat() if h.released_at else None},
+             "area": h.area, "status": h.status, "paired_by": h.paired_by, "exports": h.exports, "note": h.note,
+             "noise": h.noise, "changes": changes[h.build_id]}
+            for h in reversed(history)
+        ],
+    }
+
+
+@app.get("/api/changes")
+def list_changes(
+    field: Annotated[str, Query(min_length=2, max_length=200, pattern=r"^[^\x00]*$")],
+    build_label: Annotated[str | None, Query(alias="build", max_length=200, pattern=r"^[^\x00]*$")] = None,
+    area: Filter = None,
+    op: Literal["added", "removed", "changed", "resequenced"] | None = None,
+    limit: Limit = 50,
+    offset: Offset = 0,
+):
+    with get_engine().connect() as conn:
+        where = [_contains(change.c.field_path, field), build.c.ingested_at.is_not(None)]
+        if build_label is not None:
+            where.append(build.c.id == _get_build(conn, build_label).id)
+        if area is not None:
+            where.append(asset_status.c.area == area)
+        if op is not None:
+            where.append(change.c.op == op)
+        joined = (change.join(build, build.c.id == change.c.build_id)
+                  .join(asset, asset.c.id == change.c.asset_id)
+                  .join(asset_status, (asset_status.c.build_id == change.c.build_id)
+                        & (asset_status.c.asset_id == change.c.asset_id)))
+        total = conn.execute(select(func.count()).select_from(joined).where(*where)).scalar_one()
+        rows = conn.execute(
+            select(build.c.label, build.c.released_at, asset.c.path, asset.c.name, asset.c.type,
+                   asset_status.c.area, asset_status.c.status, change.c.field_path, change.c.op, change.c.before,
+                   change.c.after)
+            .select_from(joined).where(*where)
+            .order_by(*NEWEST_FIRST, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C"), change.c.id)
+            .limit(limit).offset(offset)
+        ).all()
+    return {
+        "total": total,
+        "items": [
+            {"build": r.label, "released_at": r.released_at.isoformat() if r.released_at else None,
+             "asset": {"path": r.path, "name": r.name, "type": r.type}, "area": r.area, "status": r.status,
+             "field_path": r.field_path, "op": r.op, "before": r.before, "after": r.after}
             for r in rows
         ],
     }
