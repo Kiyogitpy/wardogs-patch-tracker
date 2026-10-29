@@ -24,6 +24,8 @@ def test_index_and_headers(client):
     for part in ("default-src 'self'", "frame-ancestors 'none'", "https://fonts.googleapis.com",
                  "https://fonts.gstatic.com", "https://cdn.discordapp.com"):
         assert part in csp
+    # The web app sets style attributes (Hero.tsx, Odometer.tsx); without this they are blocked.
+    assert "style-src 'self' 'unsafe-inline'" in csp and "script-src" not in csp
     assert r.headers["referrer-policy"]
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["permissions-policy"]

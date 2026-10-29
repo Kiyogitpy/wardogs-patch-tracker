@@ -27,7 +27,8 @@ def engine():
 @pytest.fixture
 def db(engine):
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE build, asset, asset_alias, asset_status, change, build_area RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE build, asset, asset_alias, asset_status, change, build_area, "
+                          "app_user, session, subscription, delivery RESTART IDENTITY CASCADE"))
     return engine
 
 
