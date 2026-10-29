@@ -59,8 +59,8 @@ One webhook `POST` per subscription, JSON body:
 Each subscription is built, checked and sent in its own `try`: an unexpected error is logged (subscription id and
 exception class only), recorded as `failed` with `last_error = "internal error: <ExceptionClass>"`, and the run
 continues with the others. Before sending, the stored URL is checked again against the same pattern as sign-up
-(`tracker/webhooks.py`); a stored value that fails is not called, is recorded `failed` with `last_error = "invalid
-webhook"` (0 attempts) and gets `disabled_at`.
+(`tracker/webhooks.py`); a stored value that fails is not called, is recorded `failed` with `last_error = "invalid webhook"`
+(0 attempts) and gets `disabled_at`.
 
 `delivery` has one row per (subscription, build), written after each attempt:
 
