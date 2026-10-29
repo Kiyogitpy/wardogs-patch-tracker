@@ -9,7 +9,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 
 from tracker.ingest import TotalsMismatch, ingest
-from tracker.notify import UnknownBuild, notify
+from tracker.notify import UnknownBuild, make_engine, notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,7 +58,7 @@ def _notify(parser, url: str, args) -> int:
         parser.error("PUBLIC_ORIGIN is not set")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every request URL, which is the webhook secret
-    engine = create_engine(url)
+    engine = make_engine(url)
     try:
         result = notify(engine, args.label, origin, dry_run=args.dry_run)
     except UnknownBuild:

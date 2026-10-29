@@ -9,7 +9,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from tracker.api import NEWEST_FIRST, STATUS_ORDER, _contains
@@ -34,11 +34,19 @@ ATTEMPTS = 3
 BACKOFF = (1, 4)
 RETRY_AFTER_CAP = 30
 TIMEOUT = 10
+BUDGET = 60  # seconds one subscription may take over all its attempts, waits included
+MAX_RATE_SLEEP = 40  # of which at most this many may be spent waiting out 429s
+STATEMENT_TIMEOUT_MS = 60_000  # per statement on the notify engine
 GONE = (401, 403, 404)
 
 
 class UnknownBuild(Exception):
     pass
+
+
+def make_engine(url: str):
+    """The engine a notify run uses: every statement is bounded, so a stuck query cannot hang the run."""
+    return create_engine(url, connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"})
 
 
 # ---------- value formatting (mirrors web/src/format.ts) ----------
@@ -281,13 +289,21 @@ def _retry_after(response: httpx.Response) -> float:
     return min(max(value, 0.0), RETRY_AFTER_CAP)
 
 
-def send(client: httpx.Client, webhook: str, body: dict, sleep) -> tuple[str, int, str | None, bool]:
-    """POST with the spec's retry rules. Returns (status, tries, last_error, webhook_gone)."""
+def send(client: httpx.Client, webhook: str, body: dict, sleep, clock=time.monotonic) -> tuple[str, int, str | None, bool]:
+    """POST with the spec's retry rules inside a time budget of BUDGET seconds, waits included, of which at most
+    MAX_RATE_SLEEP go to 429 waits. When the next wait would not fit, it stops: "time budget exhausted".
+    Returns (status, tries, last_error, webhook_gone)."""
+    deadline = clock() + BUDGET
+    waited_429 = 0.0
     error = None
     for attempt in range(1, ATTEMPTS + 1):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return "failed", attempt - 1, "time budget exhausted", False
         delay = BACKOFF[min(attempt - 1, len(BACKOFF) - 1)]
+        rate_limited = False
         try:
-            response = client.post(webhook, json=body, timeout=TIMEOUT)
+            response = client.post(webhook, json=body, timeout=min(TIMEOUT, remaining))
         except httpx.HTTPError as e:
             error = f"network error: {type(e).__name__}"  # str(e) can carry the request URL
         else:
@@ -298,11 +314,14 @@ def send(client: httpx.Client, webhook: str, body: dict, sleep) -> tuple[str, in
             if code in GONE:
                 return "failed", attempt, error, True
             if code == 429:
-                delay = _retry_after(response)
+                delay, rate_limited = _retry_after(response), True
             elif code < 500:
                 return "failed", attempt, error, False
         if attempt < ATTEMPTS:
+            if clock() + delay >= deadline or (rate_limited and waited_429 + delay > MAX_RATE_SLEEP):
+                return "failed", attempt, "time budget exhausted", False
             sleep(delay)
+            waited_429 += delay if rate_limited else 0
     return "failed", ATTEMPTS, error, False
 
 
@@ -321,7 +340,7 @@ def _record(engine, sub_id: int, build_id: int, status: str, tries: int, error: 
 
 
 def notify(engine, label: str, public_origin: str, client: httpx.Client | None = None, dry_run: bool = False,
-           sleep=time.sleep) -> dict:
+           sleep=time.sleep, clock=time.monotonic) -> dict:
     """Send every due message for build `label`. Raises UnknownBuild if it is not ingested."""
     origin = public_origin.rstrip("/")
     with engine.connect() as conn:
@@ -361,7 +380,7 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
                 if not WEBHOOK_RE.fullmatch(sub.webhook_url):  # the stored value is re-checked before it is used
                     status, tries, error, gone = "failed", 0, "invalid webhook", True
                 else:
-                    status, tries, error, gone = send(client, sub.webhook_url, body, sleep)
+                    status, tries, error, gone = send(client, sub.webhook_url, body, sleep, clock)
             except Exception as e:
                 log.error("subscription %s: sending failed: %s", sub.id, type(e).__name__)
                 status, tries, error, gone = "failed", 0, f"internal error: {type(e).__name__}", False

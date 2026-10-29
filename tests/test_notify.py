@@ -241,13 +241,13 @@ def test_429_waits_retry_after_then_sends(conn_db):
     assert delivery_rows(conn_db)[0][1:3] == ("sent", 2)
 
 
-def test_429_retry_after_capped_and_three_attempts(conn_db):
+def test_429_retry_after_capped_at_30_seconds(conn_db):
     subscribe(conn_db, "area", "vehicles")
     h = Hook((429, {"retry_after": 600}))
     s = h.run(conn_db)
-    assert s["failed"] == 1 and len(h.requests) == 3 and h.sleeps == [30, 30]
+    assert s["failed"] == 1 and len(h.requests) == 2 and h.sleeps == [30]  # retry_after 600 -> 30; a second 30 is over the cap
     row = delivery_rows(conn_db)[0]
-    assert row[1:3] == ("failed", 3) and row[3].startswith("HTTP 429")
+    assert row[1:4] == ("failed", 2, "time budget exhausted")
 
 
 def test_5xx_backoff_then_success(conn_db):
@@ -641,3 +641,96 @@ def test_md_fuzz_never_leaves_a_linkable_domain_or_a_format_character():
         out = md("".join(rng.choice(alphabet) for _ in range(rng.randint(0, 30))))
         assert not re.search(r"\w[.\N{IDEOGRAPHIC FULL STOP}\N{FULLWIDTH FULL STOP}\N{HALFWIDTH IDEOGRAPHIC FULL STOP}]\w", out), out
         assert "\N{RIGHT-TO-LEFT OVERRIDE}" not in out and "://" not in out
+
+
+# ---------- bounded run: statement timeout and a time budget per subscription ----------
+
+def test_notify_engine_has_a_60_second_statement_timeout(conn_db):
+    engine = notify_mod.make_engine(conn_db.url.render_as_string(hide_password=False))
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text("SHOW statement_timeout")).scalar_one() == "1min"
+    finally:
+        engine.dispose()
+
+
+def test_cli_notify_uses_that_engine(conn_db, monkeypatch):
+    made = []
+    real = cli.make_engine
+    monkeypatch.setattr(cli, "make_engine", lambda url: made.append(url) or real(url))
+    subscribe(conn_db, "area", "vehicles")
+    assert run_cli(conn_db, monkeypatch, "--label", "b2", "--dry-run") == 0
+    assert len(made) == 1
+
+
+class FakeTime:
+    """A clock the fake Discord and the fake sleep both advance: each request takes `took` seconds."""
+
+    def __init__(self, took=0.0):
+        self.now, self.took, self.timeouts = 1000.0, took, []
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def hook(self, *replies):
+        h = Hook(*replies)
+        inner = h.handle
+
+        def handler(request):
+            self.timeouts.append(request.extensions["timeout"]["read"])
+            self.now += self.took
+            return inner(request)
+
+        h.use(handler)
+        h.sleeps = []
+        return h
+
+    def run(self, h, engine):
+        def sleep(seconds):
+            h.sleeps.append(seconds)
+            self.sleep(seconds)
+        return notify(engine, "b2", ORIGIN, h.client, False, sleep=sleep, clock=self.clock)
+
+
+def test_time_budget_stops_the_attempts_and_says_so(conn_db):
+    sub = subscribe(conn_db, "area", "vehicles")
+    t = FakeTime(took=35)
+    h = t.hook(503)
+    s = t.run(h, conn_db)
+    assert (s["sent"], s["failed"]) == (0, 1)
+    assert len(h.requests) == 2 and h.sleeps == [1]  # the 4 s backoff would end past the 60 s budget
+    assert delivery_rows(conn_db) == [(sub, "failed", 2, "time budget exhausted")]
+
+
+def test_the_budget_is_per_subscription_and_each_attempt_timeout_shrinks_to_it(conn_db):
+    first = subscribe(conn_db, "area", "vehicles")
+    second = subscribe(conn_db, "area", "vehicles", hook=HOOK + "2")
+    t = FakeTime(took=25)
+    h = t.hook(503, 503, 503, 204)
+    t.run(h, conn_db)
+    rows = {r.subscription_id: r for r in delivery_rows(conn_db)}
+    assert t.timeouts[:3] == [10, 10, pytest.approx(5.0)]  # the third attempt only has 5 s of the budget left
+    assert rows[first].status == "failed" and rows[first].last_error == "HTTP 503: boom"
+    assert rows[second].status == "sent"  # it got a full budget of its own
+
+
+def test_429_waits_are_capped_in_total(conn_db):
+    sub = subscribe(conn_db, "area", "vehicles")
+    t = FakeTime()
+    h = t.hook((429, {"retry_after": 30}))
+    s = t.run(h, conn_db)
+    assert s["failed"] == 1 and len(h.requests) == 2 and h.sleeps == [30]  # a second 30 s would pass the 40 s cap
+    assert delivery_rows(conn_db) == [(sub, "failed", 2, "time budget exhausted")]
+
+
+def test_429_waits_up_to_the_cap_are_taken(conn_db):
+    sub = subscribe(conn_db, "area", "vehicles")
+    t = FakeTime()
+    h = t.hook((429, {"retry_after": 20}))
+    t.run(h, conn_db)
+    assert len(h.requests) == 3 and h.sleeps == [20, 20]
+    row = delivery_rows(conn_db)[0]
+    assert row[:3] == (sub, "failed", 3) and row[3].startswith("HTTP 429")
