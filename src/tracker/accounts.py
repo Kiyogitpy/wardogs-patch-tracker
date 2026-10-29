@@ -1,6 +1,5 @@
 """Discord sign-in, sessions and watch subscriptions. See docs/API.md, "Accounts and subscriptions"."""
 import base64
-import binascii
 import hashlib
 import hmac
 import json
@@ -132,7 +131,7 @@ def _parse_state_cookie(cookie: str | None, state: str | None) -> str | None:
         return None
     try:
         return _safe_next(base64.urlsafe_b64decode(packed + "=" * (-len(packed) % 4)).decode())
-    except (binascii.Error, UnicodeDecodeError):
+    except ValueError:  # binascii.Error, UnicodeDecodeError, and non-ASCII input to b64decode
         return "/"
 
 

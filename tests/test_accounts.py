@@ -215,6 +215,15 @@ def test_tampered_next_in_cookie_is_revalidated(client, discord):
     assert r.status_code == 302 and r.headers["location"] == "/"
 
 
+@pytest.mark.parametrize("packed", [b"caf\xc3\xa9", b"\xff", b"\xc3\x28"])
+def test_non_ascii_state_cookie_is_a_failed_sign_in_not_500(client, packed):
+    # base64 decoding of a non-ASCII cookie raised ValueError, which escaped as a 500.
+    assert accounts._parse_state_cookie("b." + packed.decode("latin-1"), "b") == "/"
+    r = client.get("/api/auth/callback", params={"code": "c", "state": "b"},
+                   headers={"cookie": f"{STATE}=b.".encode() + packed})
+    assert r.status_code == 302 and r.headers["location"] == "/?signin=failed"
+
+
 def test_login_without_discord_config_is_503(client, monkeypatch):
     monkeypatch.delenv("DISCORD_CLIENT_ID")
     r = client.get("/api/auth/login")
