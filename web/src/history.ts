@@ -3,7 +3,7 @@ import { numericDelta } from './format'
 
 /** One value in a field's sequence across builds. */
 export interface SeqValue {
-  label: string // build label, or the base build for the starting value
+  label: string | null // build label; for the starting value, the previous build (null: there is none)
   value: Json
   absent: boolean // the field did not exist at this point
   op: Op | null // null for the starting value
@@ -27,7 +27,7 @@ export function groupByField(history: AssetHistory['history']): FieldSeries[] {
       if (!seq) {
         seq = [
           {
-            label: h.build.prev_label ?? 'before',
+            label: h.build.prev_label,
             value: c.before,
             absent: c.op === 'added' && c.before === null,
             op: null,
@@ -54,8 +54,28 @@ export function stepDelta(prev: SeqValue, next: SeqValue) {
   return numericDelta(prev.value, next.value)
 }
 
-export function numericValues(values: SeqValue[]): number[] {
-  return values.flatMap((v) => (!v.absent && typeof v.value === 'number' && Number.isFinite(v.value) ? [v.value] : []))
+/** Heading for the first value of a sequence: "Before" when no build precedes it, else "Before <label>". */
+export function startLabel(label: string | null): string {
+  return label === null ? 'Before' : `Before ${label}`
+}
+
+/** One entry per value, in order; null where the value is absent or not a finite number (a gap in the trend). */
+export function numericValues(values: SeqValue[]): (number | null)[] {
+  return values.map((v) => (!v.absent && typeof v.value === 'number' && Number.isFinite(v.value) ? v.value : null))
+}
+
+/** Split into runs of consecutive points, breaking at nulls. */
+export function segments<T>(pts: (T | null)[]): T[][] {
+  const out: T[][] = []
+  let cur: T[] = []
+  for (const p of pts) {
+    if (p === null) {
+      if (cur.length) out.push(cur)
+      cur = []
+    } else cur.push(p)
+  }
+  if (cur.length) out.push(cur)
+  return out
 }
 
 export interface Pt {
@@ -78,4 +98,26 @@ export function scalePoints(values: number[], w: number, h: number, pad: number)
     x: n === 1 ? w / 2 : pad + (i / (n - 1)) * innerW,
     y: max === min ? h / 2 : pad + (1 - (v - min) / (max - min)) * innerH,
   }))
+}
+
+/**
+ * Like scalePoints, but nulls stay null (they still take up an x slot, so gaps look like gaps).
+ * Scaling uses only the numeric values.
+ */
+export function scaleSeries(values: (number | null)[], w: number, h: number, pad: number): (Pt | null)[] {
+  const nums = values.filter((v): v is number => v !== null)
+  if (nums.length === 0) return values.map(() => null)
+  const min = Math.min(...nums)
+  const max = Math.max(...nums)
+  const n = values.length
+  const innerW = w - 2 * pad
+  const innerH = h - 2 * pad
+  return values.map((v, i) =>
+    v === null
+      ? null
+      : {
+          x: n === 1 ? w / 2 : pad + (i / (n - 1)) * innerW,
+          y: max === min ? h / 2 : pad + (1 - (v - min) / (max - min)) * innerH,
+        },
+  )
 }
