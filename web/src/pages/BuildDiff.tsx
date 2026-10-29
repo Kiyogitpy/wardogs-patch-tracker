@@ -39,8 +39,8 @@ export default function BuildDiff() {
     const next = { ...filters, page: 1, ...p }
     setSp(filtersToParams(next), { replace })
   }
-  const [qText, setQText] = useUrlText(filters.q, (q) => patch({ q }))
-  const [fieldText, setFieldText] = useUrlText(filters.field, (field) => patch({ field }))
+  const [qText, setQText] = useUrlText(filters.q, (q) => patch({ q }, true))
+  const [fieldText, setFieldText] = useUrlText(filters.field, (field) => patch({ field }, true))
 
   const build = useRemote((s) => getBuild(label, s), `build:${label}`)
   const query = apiQuery(filters)
@@ -50,7 +50,7 @@ export default function BuildDiff() {
 
   if (build.state === 'error' && build.error.status === 404) return <NotFound what="build" />
   if (build.state === 'loading') return <Loading what="build" />
-  if (build.state === 'error') return <ErrorBox error={build.error} />
+  if (build.state === 'error') return <ErrorBox error={build.error} onRetry={build.retry} />
   const b = build.data
 
   const pages = assets.state === 'ok' ? Math.max(1, Math.ceil(assets.data.total / PAGE_SIZE)) : 1
@@ -85,6 +85,9 @@ export default function BuildDiff() {
       </p>
       <StatList counts={b.totals} className="stats-big" />
 
+      <a className="skip-inline" href="#filters" onClick={(e) => { e.preventDefault(); document.getElementById("filters")?.querySelector("select")?.focus() }}>
+        Skip to filters
+      </a>
       <nav className="areas" aria-label="Areas">
         <ul>
           <li>
@@ -102,7 +105,7 @@ export default function BuildDiff() {
         </ul>
       </nav>
 
-      <form className="filters" role="search" aria-label="Filter assets" onSubmit={(e) => e.preventDefault()}>
+      <form id="filters" className="filters" role="search" aria-label="Filter assets" onSubmit={(e) => e.preventDefault()}>
         <label>
           <span>Status</span>
           <select value={filters.status} onChange={(e) => patch({ status: e.target.value as Filters['status'] })}>
@@ -152,7 +155,7 @@ export default function BuildDiff() {
         {assets.state === 'ok' ? (
           <>
             {nf.format(assets.data.total)} asset{assets.data.total === 1 ? '' : 's'}
-            {assets.data.total > PAGE_SIZE && (
+            {assets.data.total > PAGE_SIZE && assets.data.items.length > 0 && (
               <span className="muted">
                 {' '}
                 &middot; page {filters.page} of {pages}
@@ -165,8 +168,15 @@ export default function BuildDiff() {
       </h2>
       <div aria-live="polite">
         {assets.state === 'loading' && <Loading what="assets" />}
-        {assets.state === 'error' && <ErrorBox error={assets.error} />}
-        {assets.state === 'ok' && assets.data.items.length === 0 && (
+        {assets.state === 'error' && <ErrorBox error={assets.error} onRetry={assets.retry} />}
+        {assets.state === 'ok' && assets.data.items.length === 0 && assets.data.total > 0 && (
+          <Empty>
+            Page {filters.page} is past the end: there {pages === 1 ? 'is' : 'are'} {pages} page{pages === 1 ? '' : 's'} of
+            results.{' '}
+            <Link to={`?${filtersToParams({ ...filters, page: pages })}`}>Go to the last page ({pages})</Link>
+          </Empty>
+        )}
+        {assets.state === 'ok' && assets.data.items.length === 0 && assets.data.total === 0 && (
           <Empty>{hasFilters ? 'No assets match these filters.' : 'This build has no changed assets.'}</Empty>
         )}
       </div>

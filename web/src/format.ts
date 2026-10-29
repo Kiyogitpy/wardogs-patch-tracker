@@ -2,10 +2,26 @@ import type { Json } from './api'
 
 const MINUS = '−'
 
-/** Trim float noise (0.1+0.2) to 6 significant digits. */
-export function fmtNumber(n: number): string {
+function plain(n: number, digits: number): string {
   if (!Number.isFinite(n)) return String(n)
-  return String(Number(n.toPrecision(6)))
+  // toLocaleString never uses exponent notation, unlike String() for 1e-7 or 1e21.
+  return n.toLocaleString('en-US', { useGrouping: false, maximumSignificantDigits: digits })
+}
+
+/** Trim float noise (0.1+0.2) to 6 significant digits, without exponent notation. */
+export function fmtNumber(n: number): string {
+  return plain(n, 6)
+}
+
+/**
+ * Display text for a before/after pair of numbers. If 6 digits would make two
+ * different values look identical, both are shown at full precision.
+ */
+export function numberPair(before: number, after: number): [string, string] {
+  const b = fmtNumber(before)
+  const a = fmtNumber(after)
+  if (b === a && before !== after) return [plain(before, 17), plain(after, 17)]
+  return [b, a]
 }
 
 function signed(n: number, text: string): string {
@@ -28,6 +44,7 @@ export function numericDelta(before: Json, after: Json): Delta | null {
   if (before === 0) return { delta, pct: null }
   const p = (d / Math.abs(before)) * 100
   const rounded = Math.abs(p) < 10 ? Number(p.toFixed(1)) : Math.round(p)
+  if (rounded === 0 && d !== 0) return { delta, pct: `${p > 0 ? '+' : MINUS}<0.1%` }
   return { delta, pct: `${signed(rounded, String(rounded))}%` }
 }
 

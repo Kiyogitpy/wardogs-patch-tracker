@@ -49,3 +49,20 @@ describe('isLong', () => {
     expect(isLong('x'.repeat(121))).toBe(true)
   })
 })
+
+describe('close numbers (F5)', () => {
+  const rot = [-0.61237246, -0.61237156] as const
+  it('shows full precision when 6 digits make different values identical', async () => {
+    const { numberPair } = await import('./format')
+    expect(numberPair(rot[0], rot[1])).toEqual(['-0.61237246', '-0.61237156'])
+    expect(numberPair(60, 45)).toEqual(['60', '45'])
+    expect(numberPair(1, 1)).toEqual(['1', '1'])
+  })
+  it('never uses exponent notation and never reports a nonzero change as 0%', () => {
+    const d = numericDelta(rot[0], rot[1])!
+    expect(d.delta).toBe('+0.0000009')
+    expect(d.pct).toBe('+<0.1%')
+    expect(numericDelta(0.00000001, 0.00000002)!.delta).not.toMatch(/e/i)
+    expect(numericDelta(1e21, 2e21)!.delta).not.toMatch(/e/i)
+  })
+})

@@ -1,5 +1,5 @@
 import type { AssetItem, Change } from '../api'
-import { numericDelta } from '../format'
+import { numberPair, numericDelta } from '../format'
 import { StatusBadge } from './Stats'
 import ValueView from './ValueView'
 
@@ -11,15 +11,24 @@ const NOISE_LABELS: Record<string, string> = {
   type_reinterpret: 'type reinterpretations',
 }
 
+const NOISE_SINGULAR: Record<string, string> = {
+  renamed_keys: 'renamed key',
+  ref_shifts: 'reference shift',
+  dup_keys: 'duplicate key',
+  swapped_keys: 'swapped key',
+  type_reinterpret: 'type reinterpretation',
+}
+
 function noiseSummary(noise: AssetItem['noise']): string {
   return Object.entries(noise)
     .filter(([, n]) => n > 0)
-    .map(([k, n]) => `${n} ${NOISE_LABELS[k] ?? k}`)
+    .map(([k, n]) => `${n} ${n === 1 ? (NOISE_SINGULAR[k] ?? k) : (NOISE_LABELS[k] ?? k)}`)
     .join(', ')
 }
 
 function ChangeRow({ c }: { c: Change }) {
   const d = numericDelta(c.before, c.after)
+  const pair = typeof c.before === 'number' && typeof c.after === 'number' ? numberPair(c.before, c.after) : null
   return (
     <tr>
       <th scope="row" className="field">
@@ -34,10 +43,10 @@ function ChangeRow({ c }: { c: Change }) {
         <span className={`op op-${c.op}`}>{c.op}</span>
       </td>
       <td>
-        <ValueView value={c.before} absent={c.op === 'added' && c.before === null} />
+        <ValueView value={c.before} numText={pair?.[0]} absent={c.op === 'added' && c.before === null} />
       </td>
       <td>
-        <ValueView value={c.after} absent={c.op === 'removed' && c.after === null} />
+        <ValueView value={c.after} numText={pair?.[1]} absent={c.op === 'removed' && c.after === null} />
       </td>
       <td className="delta">
         {d && (
