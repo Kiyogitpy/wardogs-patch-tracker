@@ -83,6 +83,21 @@ export class ApiError extends Error {
   }
 }
 
+/** The API's `detail` as an ApiError; a 422 validation list is joined into one sentence. */
+async function errorFrom(res: Response): Promise<ApiError> {
+  let detail = res.statusText
+  try {
+    const body = await res.json()
+    if (typeof body?.detail === 'string') detail = body.detail
+    else if (Array.isArray(body?.detail)) {
+      detail = body.detail.map((d: { msg?: string }) => d?.msg).filter(Boolean).join('; ') || detail
+    }
+  } catch {
+    /* non-JSON error body */
+  }
+  return new ApiError(res.status, detail || `HTTP ${res.status}`)
+}
+
 export async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   let res: Response
   try {
@@ -91,16 +106,7 @@ export async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> 
     if (signal?.aborted) throw e
     throw new ApiError(0, 'Could not reach the API.')
   }
-  if (!res.ok) {
-    let detail = res.statusText
-    try {
-      const body = await res.json()
-      if (typeof body?.detail === 'string') detail = body.detail
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new ApiError(res.status, detail || `HTTP ${res.status}`)
-  }
+  if (!res.ok) throw await errorFrom(res)
   return (await res.json()) as T
 }
 
@@ -164,3 +170,60 @@ export const getAssetHistory = (query: string, s?: AbortSignal) => getJson<Asset
 export const getChanges = (query: string, s?: AbortSignal) => getJson<ChangesPage>(`/api/changes?${query}`, s)
 
 export const PAGE_SIZE = 50
+
+/* ---- accounts and subscriptions (step 4) ---- */
+
+export interface Me {
+  discord_id: string
+  username: string
+  avatar_url: string | null
+}
+
+export type SubKind = 'asset' | 'area' | 'field'
+
+export interface Subscription {
+  id: number
+  kind: SubKind
+  target: string | null
+  asset: { path: string; name: string } | null
+  webhook: string // masked by the server
+  created_at: string
+  disabled_at: string | null
+  last_delivery: { build: string; status: string; updated_at: string } | null
+}
+
+export type NewSubscription =
+  | { kind: 'asset'; asset_path: string; webhook_url: string }
+  | { kind: 'area' | 'field'; target: string; webhook_url: string }
+
+/** 401 means signed out, not an error. */
+export async function getMe(signal?: AbortSignal): Promise<Me | null> {
+  try {
+    return await getJson<Me>('/api/me', signal)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) return null
+    throw e
+  }
+}
+
+async function send(method: 'POST' | 'DELETE', url: string, body?: unknown): Promise<Response> {
+  let res: Response
+  try {
+    res = await fetch(url, {
+      method,
+      credentials: 'same-origin',
+      headers: body === undefined ? { Accept: 'application/json' } : { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  } catch {
+    throw new ApiError(0, 'Could not reach the API.')
+  }
+  if (!res.ok) throw await errorFrom(res)
+  return res
+}
+
+export const logout = async () => void (await send('POST', '/api/auth/logout'))
+export const listSubscriptions = (s?: AbortSignal) => getJson<Subscription[]>('/api/subscriptions', s)
+export const createSubscription = async (b: NewSubscription) =>
+  (await (await send('POST', '/api/subscriptions', b)).json()) as Subscription
+export const deleteSubscription = async (id: number) => void (await send('DELETE', `/api/subscriptions/${id}`))

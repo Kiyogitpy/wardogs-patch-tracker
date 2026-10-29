@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router'
 import { getAssets, getBuild, PAGE_SIZE, STATUSES } from '../api'
 import AssetCard from '../components/AssetCard'
+import Watch from '../components/Watch'
 import { Empty, ErrorBox, Loading, NotFound } from '../components/State'
 import { nf, STATUS_META, StatLedger } from '../components/Stats'
 import { BuildMeta } from './Timeline'
@@ -75,6 +76,15 @@ export default function BuildDiff() {
           ))}
         </ul>
       </nav>
+
+      {filters.area ? (
+        <Watch
+          target={{ kind: 'area', target: filters.area }}
+          what={`the ${b.areas.find((a) => a.id === filters.area)?.title ?? filters.area} area`}
+        />
+      ) : (
+        <p className="watch-hint">Choose an area to watch it.</p>
+      )}
 
       <form id="filters" className="filters" role="search" aria-label="Filter assets" onSubmit={(e) => e.preventDefault()}>
         <label>
