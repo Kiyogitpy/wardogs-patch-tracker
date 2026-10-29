@@ -67,11 +67,18 @@
 			not path /index.html
 		}
 		header @real Cache-Control "public, max-age=3600"
-		@shell not file {path}
+		# GET/HEAD only: header runs before respond, so the text/plain 405 above would get them too.
+		@shell {
+			not file {path}
+			method GET HEAD
+		}
 		header @shell {
 			import html_headers
 		}
-		@index path /index.html
+		@index {
+			path /index.html
+			method GET HEAD
+		}
 		header @index {
 			import html_headers
 		}
