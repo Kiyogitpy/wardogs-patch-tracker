@@ -64,7 +64,7 @@ export interface AssetItem {
   status: Status
   old_path: string | null
   paired_by: string | null
-  exports: unknown
+  exports: number | null
   note: string | null
   noise: Noise
   changes: Change[]

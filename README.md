@@ -36,7 +36,7 @@ stored; `season_diff.py` owns that classification. Migrations are in `migrations
 ## Roadmap
 
 1. ~~Schema and ingest~~
-2. API (`/builds`, `/builds/:label/changes`) and the build diff view
+2. ~~API (`docs/API.md`) and the build diff view~~
 3. Field history across builds and search
 4. Public deployment; Discord OAuth login for subscriptions to assets, areas or field patterns, delivered by Discord
    webhook after each ingest
@@ -49,3 +49,13 @@ uv run uvicorn tracker.api:app --port 8000
 ```
 
 Routes are under `/api` (see `docs/API.md`); interactive docs at `/docs`.
+
+## Run the web app
+
+```
+cd web
+npm ci
+npm run dev          # http://localhost:5173, proxies /api to 127.0.0.1:8000 (override with API_TARGET)
+npm test             # Vitest
+npm run build        # type-check and build to web/dist
+```

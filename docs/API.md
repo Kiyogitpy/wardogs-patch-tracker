@@ -91,6 +91,9 @@ Changes inside an asset keep ingest order (`change.id`).
 }
 ```
 
+`op` is one of `added`, `removed`, `changed` or `resequenced`. For `added`, `before` is null; for `removed`, `after`
+is null. `exports` is an integer (the number of exports in an added asset) or null.
+
 `total` counts the assets matching every filter, ignoring `limit`/`offset`. `old_path` is the `asset_alias.old_path`
 recorded for this asset in this build, else null.
 
