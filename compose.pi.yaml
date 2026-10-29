@@ -5,15 +5,27 @@
 #   sudo tailscale funnel --bg 8080
 # Standalone, not an override: keep it in sync with compose.prod.yaml (same db, migrate, app).
 #
-# Networks: `edge` (caddy + app, fixed subnet so uvicorn can trust exactly that range for
-# X-Forwarded-For) and `backend` (app + db, no outside access). Only caddy publishes ports.
+# Networks: `edge` (caddy + app) and `backend` (app + db, no outside access). Only caddy publishes
+# ports. Caddy has a fixed address on `edge` (CADDY_IP) and uvicorn trusts X-Forwarded-For from that
+# one address only. EDGE_SUBNET, EDGE_GATEWAY and CADDY_IP are defined once below (x-edge-*) and used
+# by the network and by the trust settings, so they cannot drift. Defaults differ between this file
+# and the other stack, so both can run on one host.
 #
 # Restart policy: "unless-stopped" restarts a container that EXITS, but Docker never restarts one
 # that is merely "unhealthy". Healthchecks here gate start order and show in `docker compose ps`.
 # A hung (not crashed) service needs `docker compose restart <name>` or an external watchdog.
+x-edge-subnet: &edge_subnet ${EDGE_SUBNET:-172.29.58.0/24}
+x-edge-gateway: &edge_gateway ${EDGE_GATEWAY:-172.29.58.1}
+# Top of the subnet: Docker hands dynamic addresses out from the bottom, so app/db never take it first.
+x-caddy-ip: &caddy_ip ${CADDY_IP:-172.29.58.254}
+# Rotated json logs for every service: an unrotated json-file log grows until the disk is full.
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}
 x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   restart: unless-stopped
+  logging: *logging
 
 services:
   db:
@@ -41,6 +53,7 @@ services:
     build: .
     security_opt: ["no-new-privileges:true"]
     restart: "no"
+    logging: *logging
     read_only: true
     tmpfs: ["/tmp:size=64m,noexec,nosuid"]
     cap_drop: [ALL]
@@ -70,8 +83,8 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
       DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
-      # Trust X-Forwarded-For only from the edge network (caddy sets it to the client address).
-      FORWARDED_ALLOW_IPS: 172.29.57.0/24
+      # Trust X-Forwarded-For only from Caddy's own address (it sets it to the client address).
+      FORWARDED_ALLOW_IPS: *caddy_ip
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -80,7 +93,11 @@ services:
 
   caddy:
     <<: *hardening
-    image: caddy:2.11.7
+    # Caddy with the built web app baked in at /srv (Dockerfile target `caddy`), non-root.
+    image: ${CADDY_IMAGE:-wardogs-patch-tracker-caddy:latest}
+    build:
+      context: .
+      target: caddy
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.pi", "--adapter", "caddyfile"]
     read_only: true
     tmpfs: ["/tmp:size=16m,noexec,nosuid"]
@@ -88,6 +105,8 @@ services:
     cap_add: [NET_BIND_SERVICE]  # the caddy binary carries this file capability; without it, exec fails
     mem_limit: 256m
     pids_limit: 200
+    environment:
+      EDGE_GATEWAY: *edge_gateway  # the one address Caddyfile.pi trusts to set X-Forwarded-For
     ports:
       # Loopback only: nothing on the LAN or the internet reaches Caddy except through Funnel.
       # PI_PORT exists for local tests; leave it at 8080 and run `tailscale funnel --bg 8080`.
@@ -104,13 +123,16 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    networks: [edge]
+    networks:
+      edge:
+        ipv4_address: *caddy_ip
 
 networks:
   edge:
     ipam:
       config:
-        - subnet: 172.29.57.0/24
+        - subnet: *edge_subnet
+          gateway: *edge_gateway
   backend:
     internal: true
 

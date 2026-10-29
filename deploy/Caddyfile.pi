@@ -7,9 +7,12 @@
 			read_body 30s
 			idle 2m
 		}
-		# Funnel connects from the host (seen here as the Docker bridge gateway, a private address).
-		# Nothing else can reach this port: compose publishes it on 127.0.0.1 only.
-		trusted_proxies static private_ranges
+		# Funnel connects from the host, which Caddy sees as the edge network's gateway. Trust
+		# exactly that one address (not the whole private range: other containers can reach this
+		# port too). "strict" takes the RIGHTMOST untrusted X-Forwarded-For entry, which is what the
+		# last trusted hop appended; entries to its left are client-controlled.
+		trusted_proxies static {$EDGE_GATEWAY}/32
+		trusted_proxies_strict
 		client_ip_headers X-Forwarded-For
 	}
 }
