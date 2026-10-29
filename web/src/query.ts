@@ -1,4 +1,4 @@
-import { PAGE_SIZE, STATUSES, type Status } from './api'
+import { PAGE_SIZE, STATUSES, type Op, type Status } from './api'
 
 export interface Filters {
   area: string
@@ -42,4 +42,110 @@ export function apiQuery(f: Filters): string {
   sp.set('limit', String(PAGE_SIZE))
   sp.set('offset', String((f.page - 1) * PAGE_SIZE))
   return sp.toString()
+}
+
+function parsePage(sp: URLSearchParams): number {
+  const page = Number.parseInt(sp.get('page') ?? '1', 10)
+  return Number.isFinite(page) && page > 1 ? page : 1
+}
+
+function pageParams(sp: URLSearchParams, page: number): string {
+  sp.set('limit', String(PAGE_SIZE))
+  sp.set('offset', String((page - 1) * PAGE_SIZE))
+  return sp.toString()
+}
+
+/* ---- /search ---- */
+export interface SearchState {
+  q: string
+  page: number
+}
+
+export function parseSearch(sp: URLSearchParams): SearchState {
+  return { q: sp.get('q') ?? '', page: parsePage(sp) }
+}
+
+export function searchToParams(s: SearchState): URLSearchParams {
+  const sp = new URLSearchParams()
+  if (s.q) sp.set('q', s.q)
+  if (s.page > 1) sp.set('page', String(s.page))
+  return sp
+}
+
+export function searchApiQuery(s: SearchState): string {
+  const sp = new URLSearchParams()
+  if (s.q) sp.set('q', s.q)
+  return pageParams(sp, s.page)
+}
+
+/* ---- /asset ---- */
+export type AssetView = 'field' | 'build'
+
+export interface AssetState {
+  path: string
+  field: string
+  view: AssetView
+}
+
+export function parseAsset(sp: URLSearchParams): AssetState {
+  return {
+    path: sp.get('path') ?? '',
+    field: sp.get('field') ?? '',
+    view: sp.get('view') === 'build' ? 'build' : 'field',
+  }
+}
+
+export function assetToParams(s: AssetState): URLSearchParams {
+  const sp = new URLSearchParams()
+  sp.set('path', s.path)
+  if (s.field) sp.set('field', s.field)
+  if (s.view === 'build') sp.set('view', 'build')
+  return sp
+}
+
+/** The API query: path and field only; the view is a client concern. */
+export function assetApiQuery(s: AssetState): string {
+  const sp = new URLSearchParams({ path: s.path })
+  if (s.field) sp.set('field', s.field)
+  return sp.toString()
+}
+
+/* ---- /changes ---- */
+export const OPS: Op[] = ['added', 'removed', 'changed', 'resequenced']
+export const MIN_FIELD_CHARS = 2
+
+export interface ChangesState {
+  field: string
+  build: string
+  area: string
+  op: Op | ''
+  page: number
+}
+
+export const EMPTY_CHANGES: ChangesState = { field: '', build: '', area: '', op: '', page: 1 }
+
+export function parseChanges(sp: URLSearchParams): ChangesState {
+  const op = sp.get('op') ?? ''
+  return {
+    field: sp.get('field') ?? '',
+    build: sp.get('build') ?? '',
+    area: sp.get('area') ?? '',
+    op: (OPS as string[]).includes(op) ? (op as Op) : '',
+    page: parsePage(sp),
+  }
+}
+
+export function changesToParams(s: ChangesState): URLSearchParams {
+  const sp = new URLSearchParams()
+  if (s.field) sp.set('field', s.field)
+  if (s.build) sp.set('build', s.build)
+  if (s.area) sp.set('area', s.area)
+  if (s.op) sp.set('op', s.op)
+  if (s.page > 1) sp.set('page', String(s.page))
+  return sp
+}
+
+export function changesApiQuery(s: ChangesState): string {
+  const sp = changesToParams({ ...s, page: 1 })
+  return pageParams(sp, s.page)
 }

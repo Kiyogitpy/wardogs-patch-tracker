@@ -1,33 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router'
 import { getAssets, getBuild, PAGE_SIZE, STATUSES } from '../api'
 import AssetCard from '../components/AssetCard'
 import { Empty, ErrorBox, Loading, NotFound } from '../components/State'
 import { nf, STATUS_META, StatList } from '../components/Stats'
-import { useDebounced, useRemote, useTitle } from '../hooks'
+import { useRemote, useTitle, useUrlText } from '../hooks'
 import { apiQuery, EMPTY_FILTERS, filtersToParams, parseFilters, type Filters } from '../query'
 import { totalAssets } from '../format'
-
-/** A text input whose debounced value is written to the URL; follows external URL changes (back button). */
-function useUrlText(urlValue: string, commit: (v: string) => void) {
-  const [text, setText] = useState(urlValue)
-  const debounced = useDebounced(text)
-  const lastCommitted = useRef(urlValue)
-  useEffect(() => {
-    if (debounced !== lastCommitted.current) {
-      lastCommitted.current = debounced
-      commit(debounced)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debounced])
-  useEffect(() => {
-    if (urlValue !== lastCommitted.current) {
-      lastCommitted.current = urlValue
-      setText(urlValue)
-    }
-  }, [urlValue])
-  return [text, setText] as const
-}
 
 export default function BuildDiff() {
   const { label = '' } = useParams()
@@ -144,6 +123,11 @@ export default function BuildDiff() {
             placeholder="e.g. BaseDamage"
           />
         </label>
+        {fieldText.trim().length >= 2 && (
+          <Link className="side-link" to={`/changes?${new URLSearchParams({ field: fieldText.trim() })}`}>
+            search all builds &rarr;
+          </Link>
+        )}
         {hasFilters && (
           <Link className="btn clear" to={`?${filtersToParams(EMPTY_FILTERS)}`} onClick={() => { setQText(''); setFieldText('') }}>
             Clear filters

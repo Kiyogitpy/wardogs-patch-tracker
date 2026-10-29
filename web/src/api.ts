@@ -110,4 +110,57 @@ export const getBuild = (label: string, s?: AbortSignal) =>
 export const getAssets = (label: string, query: string, s?: AbortSignal) =>
   getJson<AssetPage>(`/api/builds/${encodeURIComponent(label)}/assets?${query}`, s)
 
+export interface AssetHit {
+  path: string
+  name: string
+  type: string
+  builds: number
+  last: { label: string; status: Status; area: string }
+}
+
+export interface AssetSearchPage {
+  total: number
+  items: AssetHit[]
+}
+
+export interface HistoryEntry {
+  build: { label: string; prev_label: string | null; released_at: string | null }
+  area: string
+  status: Status
+  paired_by: string | null
+  exports: number | null
+  note: string | null
+  noise: Noise
+  changes: Change[]
+}
+
+export interface AssetHistory {
+  path: string
+  name: string
+  type: string
+  aliases: { old_path: string; build: string }[]
+  history: HistoryEntry[]
+}
+
+export interface ChangeHit {
+  build: string
+  released_at: string | null
+  asset: { path: string; name: string; type: string }
+  area: string
+  status: Status
+  field_path: string
+  op: Op
+  before: Json
+  after: Json
+}
+
+export interface ChangesPage {
+  total: number
+  items: ChangeHit[]
+}
+
+export const searchAssets = (query: string, s?: AbortSignal) => getJson<AssetSearchPage>(`/api/assets?${query}`, s)
+export const getAssetHistory = (query: string, s?: AbortSignal) => getJson<AssetHistory>(`/api/asset?${query}`, s)
+export const getChanges = (query: string, s?: AbortSignal) => getJson<ChangesPage>(`/api/changes?${query}`, s)
+
 export const PAGE_SIZE = 50

@@ -1,3 +1,4 @@
+import { Link } from 'react-router'
 import type { AssetItem, Change } from '../api'
 import { numberPair, numericDelta } from '../format'
 import { StatusBadge } from './Stats'
@@ -60,13 +61,39 @@ function ChangeRow({ c }: { c: Change }) {
   )
 }
 
+export function ChangesTable({ name, changes }: { name: string; changes: Change[] }) {
+  if (changes.length === 0) return null
+  return (
+    <div className="table-wrap" tabIndex={0} role="region" aria-label={`Changes to ${name}`}>
+      <table className="changes">
+        <thead>
+          <tr>
+            <th scope="col">Field</th>
+            <th scope="col">Op</th>
+            <th scope="col">Before</th>
+            <th scope="col">After</th>
+            <th scope="col">Delta</th>
+          </tr>
+        </thead>
+        <tbody>
+          {changes.map((c, i) => (
+            <ChangeRow key={`${c.field_path}:${i}`} c={c} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 export default function AssetCard({ asset }: { asset: AssetItem }) {
   const noiseTotal = Object.values(asset.noise).reduce((a, b) => a + b, 0)
   const noiseOnly = asset.status === 'modified' && asset.changes.length === 0 && noiseTotal > 0
   return (
     <article className="card" aria-label={asset.name}>
       <header className="card-head">
-        <h3>{asset.name}</h3>
+        <h3>
+          <Link to={`/asset?${new URLSearchParams({ path: asset.path })}`}>{asset.name}</Link>
+        </h3>
         <StatusBadge status={asset.status} />
         <span className="chip">{asset.type}</span>
         {noiseOnly && (
@@ -87,26 +114,7 @@ export default function AssetCard({ asset }: { asset: AssetItem }) {
           Only serialization noise changed here: {noiseSummary(asset.noise)}. No game values differ.
         </p>
       )}
-      {asset.changes.length > 0 && (
-        <div className="table-wrap" tabIndex={0} role="region" aria-label={`Changes to ${asset.name}`}>
-          <table className="changes">
-            <thead>
-              <tr>
-                <th scope="col">Field</th>
-                <th scope="col">Op</th>
-                <th scope="col">Before</th>
-                <th scope="col">After</th>
-                <th scope="col">Delta</th>
-              </tr>
-            </thead>
-            <tbody>
-              {asset.changes.map((c, i) => (
-                <ChangeRow key={`${c.field_path}:${i}`} c={c} />
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      <ChangesTable name={asset.name} changes={asset.changes} />
     </article>
   )
 }
