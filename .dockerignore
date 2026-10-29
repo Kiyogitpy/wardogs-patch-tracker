@@ -1,0 +1,15 @@
+.git
+.venv
+**/node_modules
+**/dist
+tests
+docs
+.env
+**/.env
+.env.*
+**/__pycache__
+.pytest_cache
+*.md
+!README.md
+compose*.yaml
+deploy

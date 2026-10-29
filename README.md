@@ -59,3 +59,7 @@ npm run dev          # http://localhost:5173, proxies /api to 127.0.0.1:8000 (ov
 npm test             # Vitest
 npm run build        # type-check and build to web/dist
 ```
+
+## Deploy
+
+`Dockerfile` builds one image (web app plus API); `compose.prod.yaml` runs it with Postgres and Caddy (automatic HTTPS) on any Docker host. Copy `deploy/.env.example` to `.env`, fill it in, then `docker compose -f compose.prod.yaml up -d --build`. Full steps (DNS, Discord app, loading data, backup, rollback) are in `docs/DEPLOY.md`.
