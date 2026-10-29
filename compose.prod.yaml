@@ -77,6 +77,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN in .env}
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}  # the app refuses to start if PUBLIC_ORIGIN's host differs
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
       DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
