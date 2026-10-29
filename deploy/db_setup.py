@@ -3,8 +3,8 @@
 1. `alembic upgrade head` as the owner role (MIGRATE_DATABASE_URL).
 2. Create or update the restricted role named in DATABASE_URL (default `tracker_app`) and grant it
    DML only: SELECT/INSERT/UPDATE/DELETE on tables, USAGE on sequences, same for future tables
-   (the owner's default privileges). No DDL, no superuser, no access to alembic_version, no TEMP,
-   at most 20 connections, statement_timeout 5s.
+   (the owner's default privileges). No DDL, no superuser, no access to alembic_version, no TEMP, no CONNECT to the postgres and template1
+   databases, at most 20 connections, statement_timeout 5s.
 
 Idempotent: safe to run on every deploy. The owner's credentials never reach the `app` service.
 """
@@ -22,6 +22,7 @@ def conn_args(url):
 
 
 PLACEHOLDERS = {"", "change-me", "changeme", "password"}
+MIN_PASSWORD_LENGTH = 16  # same rule as check_environment in src/tracker/server.py
 # -1 = no per-role limit. A limit was tried and dropped: on Postgres 16.15 a burst past a role's limit
 # crash-restarted the whole server, so the limit itself was a DoS. Load is bounded by the pools and timeouts.
 MAX_CONNECTIONS = -1
@@ -40,6 +41,13 @@ def main() -> int:
     if "change-me" in (owner_raw + app_raw).lower() or bad_password(owner.password) or bad_password(app.password):
         print("refusing to run with an empty, whitespace-only or placeholder password (change-me, changeme, password)",
               file=sys.stderr)
+        return 2
+    if len(owner.password) < MIN_PASSWORD_LENGTH or len(app.password) < MIN_PASSWORD_LENGTH:
+        print(f"both database passwords must be at least {MIN_PASSWORD_LENGTH} characters (openssl rand -hex 24)",
+              file=sys.stderr)
+        return 2
+    if owner.password == app.password:
+        print("DATABASE_URL and MIGRATE_DATABASE_URL must use different passwords", file=sys.stderr)
         return 2
     name = (app.username or "").lower()
     if not name or name in (owner.username.lower(), "postgres") or name.startswith("pg_"):
@@ -80,6 +88,10 @@ def main() -> int:
             "REVOKE ALL ON alembic_version FROM {role}",
         ):
             conn.execute(sql.SQL(stmt).format(role=role, db=db))
+        # PUBLIC may connect to and create temp tables in the maintenance databases by default; that would
+        # let tracker_app create temp tables and large objects there. The owner keeps access as superuser.
+        for maint in ("postgres", "template1"):
+            conn.execute(sql.SQL("REVOKE CONNECT, TEMP ON DATABASE {} FROM PUBLIC").format(sql.Identifier(maint)))
     print(f"migrations applied; role {app.username} has DML-only access", flush=True)
     return 0
 

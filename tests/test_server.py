@@ -55,6 +55,12 @@ def test_missing_asset_falls_back_to_index(client):
     assert "spa" in client.get("/assets/missing.js").text
 
 
+@pytest.mark.parametrize("path", ["/API/x", "/Api/builds", "/API", "/apix", "/api-x/y"])
+def test_api_prefix_is_case_sensitive(client, path):
+    r = client.get(path)
+    assert r.status_code == 200 and "spa" in r.text  # static fallback, never the API
+
+
 def test_api_unknown_is_json_404(client):
     r = client.get("/api/x")
     assert r.status_code == 404
@@ -135,7 +141,8 @@ def test_access_log_filter_is_installed(caplog):
     assert "SECRET" not in caplog.text and '"GET /p HTTP' in caplog.text
 
 
-GOOD = {"DATABASE_URL": "postgresql+psycopg://u:abc123@db/t", "PUBLIC_ORIGIN": "https://t.example.com"}
+STRONG = "0123456789abcdef0123456789abcdef"
+GOOD = {"DATABASE_URL": f"postgresql+psycopg://u:{STRONG}@db/t", "PUBLIC_ORIGIN": "https://t.example.com"}
 
 
 def origin(value, **extra):
@@ -152,6 +159,14 @@ def origin(value, **extra):
     ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u@db/t"}, "DATABASE_URL"),
     ({**GOOD, "MIGRATE_DATABASE_URL": "postgresql+psycopg://u:change-me@db/t"}, "MIGRATE_DATABASE_URL"),
     ({**GOOD, "MIGRATE_DATABASE_URL": "postgresql+psycopg://u:Password@db/t"}, "MIGRATE_DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": f"mysql://u:{STRONG}@db/t"}, "scheme"),
+    ({**GOOD, "DATABASE_URL": f"postgresql+asyncpg://u:{STRONG}@db/t"}, "scheme"),
+    ({**GOOD, "DATABASE_URL": f"sqlite://u:{STRONG}@db/t"}, "scheme"),
+    ({**GOOD, "MIGRATE_DATABASE_URL": f"postgresql+psycopg://o:{STRONG}@db/t"}, "different passwords"),
+    ({**GOOD, "DATABASE_URL": f"postgresql://u:{STRONG}@db/t", "MIGRATE_DATABASE_URL": f"postgresql://o:{STRONG}@db/t"},
+     "different passwords"),
+    (origin("https://t.example.com", DOMAIN="other.example.com"), "does not match DOMAIN"),
+    (origin("https://sub.t.example.com", DOMAIN="t.example.com"), "does not match DOMAIN"),
     ({"DATABASE_URL": GOOD["DATABASE_URL"]}, "PUBLIC_ORIGIN is not set"),
     (origin("http://t.example.com"), "must be https"),
     (origin("http://localhost:8000"), "COOKIE_SECURE=0"),
@@ -175,14 +190,54 @@ def origin(value, **extra):
     (origin("https://t.example.com", COOKIE_SECURE="0"), "COOKIE_SECURE=0"),
     (origin("https://localhost", COOKIE_SECURE="0"), "COOKIE_SECURE=0"),
     (origin("http://localhost.evil.com"), "must be https"),
+    # Third review: hostnames that Caddy or a browser would read differently than the app.
+    (origin("https://example.com;"), "invalid hostname"),
+    (origin('https://example.com"'), "invalid hostname"),
+    (origin("https://*.example.com"), "invalid hostname"),
+    (origin("https://."), "invalid hostname"),
+    (origin("https://-"), "invalid hostname"),
+    (origin("https://example.com%2f"), "invalid hostname"),
+    (origin("https://example.com:"), "empty port"),
+    (origin("https://example.com:0"), "port 0"),
+    (origin("https://example.com:65536"), "not a valid URL"),
+    (origin("https://-a.example.com"), "invalid hostname"),
+    (origin("https://a-.example.com"), "invalid hostname"),
+    (origin("https://example..com"), "invalid hostname"),
+    (origin("https://example.com."), "invalid hostname"),
+    (origin("https://nodots"), "invalid hostname"),
+    (origin("https://" + "a" * 64 + ".example.com"), "invalid hostname"),
+    (origin("https://" + ".".join(["a" * 60] * 5)), "invalid hostname"),
+    (origin("https://exa_mple.com"), "invalid hostname"),
 ])
 def test_check_environment_refuses(env, message):
     with pytest.raises(RuntimeError, match=message):
         check_environment(env)
 
 
+@pytest.mark.parametrize("password", ["admin", "tracker", "postgres", "a", "Password1", "x" * 15])
+@pytest.mark.parametrize("name", ["DATABASE_URL", "MIGRATE_DATABASE_URL"])
+def test_check_environment_refuses_weak_password(name, password):
+    env = {**GOOD, name: f"postgresql+psycopg://u:{password}@db/t"}
+    with pytest.raises(RuntimeError, match=f"{name} password is shorter than 16"):
+        check_environment(env)
+
+
+def test_check_environment_refuses_identical_passwords_across_roles():
+    env = {**GOOD, "MIGRATE_DATABASE_URL": GOOD["DATABASE_URL"].replace("u:", "tracker:")}
+    with pytest.raises(RuntimeError, match="different passwords"):
+        check_environment(env)
+
+
 @pytest.mark.parametrize("env", [
     GOOD,
+    {**GOOD, "MIGRATE_DATABASE_URL": f"postgresql+psycopg://o:{STRONG[::-1]}@db/t"},
+    {**GOOD, "DATABASE_URL": f"postgresql://u:{STRONG}@db/t"},
+    {**GOOD, "DOMAIN": "t.example.com"},
+    {**GOOD, "DOMAIN": "T.Example.com"},
+    origin("https://203.0.113.7:8443"),
+    origin("https://[2001:db8::1]"),
+    origin("https://xn--bcher-kva.example"),
+    origin("https://" + ".".join(["a" * 50] * 4)),
     origin("https://t.example.com/"),
     origin("https://t.example.com:8443"),
     origin("https://localhost.evil.com"),  # https is fine; it is just not "localhost over http"

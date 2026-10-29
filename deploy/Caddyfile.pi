@@ -1,6 +1,10 @@
 # Pi behind Tailscale Funnel: plain http on loopback only; Funnel terminates TLS.
 {
 	auto_https off
+	# The container healthcheck polls the admin API every 30s; keep those requests out of the log.
+	log {
+		exclude admin.api
+	}
 	servers {
 		timeouts {
 			read_header 10s

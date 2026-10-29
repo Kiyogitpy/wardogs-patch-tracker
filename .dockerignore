@@ -14,3 +14,7 @@ docs
 compose*.yaml
 deploy/*
 !deploy/db_setup.py
+*.dump
+backup-*
+**/*.dump
+**/backup-*

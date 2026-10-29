@@ -5,8 +5,10 @@ here (dev, `uvicorn tracker.api:app`, still has them); in production they fall t
 Everything else is served from STATIC_DIR, with unknown GET paths falling back to index.html
 so client-side routes work on reload.
 """
+import ipaddress
 import logging
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -60,7 +62,23 @@ logging.getLogger("uvicorn.access").addFilter(_StripQuery())
 
 
 PLACEHOLDER_PASSWORDS = {"", "change-me", "changeme", "password"}
+MIN_PASSWORD_LENGTH = 16
+DB_SCHEMES = ("postgresql", "postgresql+psycopg")
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _host_ok(host: str) -> bool:
+    """A DNS hostname (letters, digits, hyphens; dotted unless localhost) or a literal IP address."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost":
+        return True
+    labels = host.split(".")
+    return len(host) <= 253 and len(labels) >= 2 and all(_LABEL.fullmatch(label) for label in labels)
 
 
 def _origin_problem(raw: str) -> str | None:
@@ -80,21 +98,37 @@ def _origin_problem(raw: str) -> str | None:
         return "has no hostname"
     if parts.path not in ("", "/"):
         return "must not have a path"
+    if parts.netloc.endswith(":"):
+        return "has an empty port"
+    if parts.port == 0:
+        return "has port 0"
+    if not _host_ok(parts.hostname):
+        return "has an invalid hostname"
     return None
 
 
 def check_environment(env=os.environ) -> None:
     """Refuse to serve with placeholder secrets or an origin that cannot be right in production."""
+    passwords = {}
     for name in ("DATABASE_URL", "MIGRATE_DATABASE_URL"):
         url = env.get(name)
         if not url:
             continue
         try:
-            password = make_url(url).password
+            parsed = make_url(url)
         except ArgumentError:
             raise RuntimeError(f"{name} is not a valid database URL") from None
+        password = parsed.password
         if "change-me" in url.lower() or (password or "").strip().lower() in PLACEHOLDER_PASSWORDS:
             raise RuntimeError(f"{name} has an empty or placeholder password (change-me...); set a real one in .env")
+        if name == "DATABASE_URL" and parsed.drivername not in DB_SCHEMES:
+            raise RuntimeError(f"{name} must use the postgresql or postgresql+psycopg scheme (got {parsed.drivername!r})")
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise RuntimeError(f"{name} password is shorter than {MIN_PASSWORD_LENGTH} characters; "
+                               "generate one with: openssl rand -hex 24")
+        passwords[name] = password
+    if len(passwords) == 2 and passwords["DATABASE_URL"] == passwords["MIGRATE_DATABASE_URL"]:
+        raise RuntimeError("DATABASE_URL and MIGRATE_DATABASE_URL must use different passwords")
     origin = env.get("PUBLIC_ORIGIN", "")
     if not origin:
         raise RuntimeError("PUBLIC_ORIGIN is not set (expected https://<your-domain>)")
@@ -102,6 +136,9 @@ def check_environment(env=os.environ) -> None:
     if problem:
         raise RuntimeError(f"PUBLIC_ORIGIN {problem} (got {origin!r}); expected https://<your-domain>[:port]")
     parts = urlsplit(origin)
+    domain = env.get("DOMAIN")
+    if domain and (parts.hostname or "") != domain.lower():
+        raise RuntimeError(f"PUBLIC_ORIGIN host {parts.hostname!r} does not match DOMAIN {domain!r}")
     local_http = parts.scheme == "http" and parts.hostname in LOCAL_HOSTS
     if parts.scheme == "http" and not local_http:
         raise RuntimeError(f"PUBLIC_ORIGIN must be https (got {origin!r})")
@@ -113,6 +150,7 @@ def check_environment(env=os.environ) -> None:
 
 
 def _is_api(path: str) -> bool:
+    # Exact, case-sensitive prefix: the same rule as Caddy's `path_regexp ^/api(/|$)`, so /API/x is not API.
     return any(path == p or path.startswith(p + "/") for p in API_PREFIXES)
 
 

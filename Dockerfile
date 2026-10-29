@@ -18,15 +18,35 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
-# Caddy serves the static web app itself (cheap), and proxies only /api to the app.
-FROM caddy:2.11.7 AS caddy
+# The published caddy:2.11.7 binary was built with Go 1.26.8 and golang.org/x/net 0.59.0 (fixable critical
+# and high CVEs). Rebuild the same Caddy version with a patched toolchain and patched modules, then drop the
+# binary into the pinned runtime image below. Bump the three pins together (see docs/DEPLOY.md).
+FROM caddy:2.11.7-builder AS caddy-build
+ENV GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0
+RUN xcaddy build v2.11.7 --output /caddy       --replace golang.org/x/net=golang.org/x/net@v0.62.0       --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.6       --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0
+
+# Runtime filesystem: the pinned caddy:2.11.7 image with the rebuilt binary swapped in, the web app at
+# /srv, Alpine fixes and the file capability. It is then copied into a fresh image (next stage), so the
+# old binary does not stay in a lower layer where scanners would still report it.
+FROM caddy:2.11.7 AS caddy-rootfs
+COPY --from=caddy-build /caddy /usr/bin/caddy
 COPY --from=web /web/dist /srv
 # Pick up Alpine security fixes published since the pinned tag was built (curl, brotli...).
 RUN apk upgrade --no-cache
-# Non-root: the named volumes copy this ownership when first created. The caddy binary carries
-# cap_net_bind_service as a file capability; compose adds it back to the bounding set.
+# The caddy binary carries cap_net_bind_service as a file capability; compose adds it back to the bounding set.
+RUN setcap cap_net_bind_service=+ep /usr/bin/caddy && /usr/bin/caddy version
+# Non-root: the named volumes copy this ownership when first created.
 RUN mkdir -p /data/caddy /config/caddy && chown -R 65532:65532 /data /config
+
+# Caddy serves the static web app itself (cheap), and proxies only /api to the app.
+# Same runtime settings as the upstream caddy image (env, ports, workdir, default command).
+FROM scratch AS caddy
+COPY --from=caddy-rootfs / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CADDY_VERSION=v2.11.7     XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+EXPOSE 80 443 443/udp 2019
+WORKDIR /srv
 USER 65532:65532
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
 
 FROM python:3.13.18-slim AS app
 # No uv, no pip, no setuptools in the final image (they carry their own CVEs and are not needed to run).
