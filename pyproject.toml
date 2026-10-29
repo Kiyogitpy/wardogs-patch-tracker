@@ -5,8 +5,10 @@ description = "History and alerts for Wardogs game data changes across builds"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.20.1",
+    "fastapi>=0.162.0",
     "psycopg[binary]>=3.3.6",
     "sqlalchemy>=2.1.6",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]
@@ -24,5 +26,6 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=9.2.0",
 ]

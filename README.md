@@ -40,3 +40,12 @@ stored; `season_diff.py` owns that classification. Migrations are in `migrations
 3. Field history across builds and search
 4. Public deployment; Discord OAuth login for subscriptions to assets, areas or field patterns, delivered by Discord
    webhook after each ingest
+
+## Run the API
+
+```
+export DATABASE_URL=postgresql+psycopg://tracker:tracker@127.0.0.1:5433/tracker
+uv run uvicorn tracker.api:app --port 8000
+```
+
+Routes are under `/api` (see `docs/API.md`); interactive docs at `/docs`.
