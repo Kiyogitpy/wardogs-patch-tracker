@@ -15,7 +15,8 @@ API_PREFIXES = ("/api", "/docs", "/redoc", "/openapi.json")
 
 CSP = "; ".join([
     "default-src 'self'",
-    "style-src 'self' https://fonts.googleapis.com",
+    # 'unsafe-inline' for React style attributes (hero sizing, odometer); scripts stay 'self' only.
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src https://fonts.gstatic.com",
     "img-src 'self' data: https://cdn.discordapp.com",
     "frame-ancestors 'none'",
