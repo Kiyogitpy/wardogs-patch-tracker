@@ -1,6 +1,8 @@
 """Load one `season_diff.py` output directory into the database as one build."""
 import json
 import math
+import os
+import stat
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -24,11 +26,48 @@ MAX_NAME = 300
 MAX_PATH = 1000
 
 
-def _read_json(path: Path):
+def _need(obj, where: str, *keys: str) -> None:
+    """obj must be an object holding every one of `keys`; a ValueError names what is wrong."""
+    if not isinstance(obj, dict):
+        raise ValueError(f"{where}: expected dict, found {type(obj).__name__}")
+    for key in keys:
+        if key not in obj:
+            raise ValueError(f"{where}: missing {key!r}")
+
+
+def _list(obj, where: str) -> list:
+    if not isinstance(obj, list):
+        raise ValueError(f"{where}: expected list, found {type(obj).__name__}")
+    return obj
+
+
+def _read_json(root: Path, path: Path):
+    """Parse a JSON file that must be a regular file inside `root` (the resolved diff directory).
+
+    The path was checked by the caller; between that check and the open a component could be swapped for a
+    symlink. So the file is opened first and then verified: it is a regular file, and the path, resolved
+    again now, is still inside `root` and is the very file that was opened. What remains is a swap after
+    this check, which needs write access to the diff directory (an operator-run input) and gains nothing
+    beyond reading one JSON file that must also pass every other check."""
     def no_constants(token):
         raise ValueError(f"{path.name}: {token} is not valid JSON")
+    if not path.exists():
+        raise ValueError(f"{path.name}: does not exist")
+    if not path.is_file():
+        raise ValueError(f"{path.name}: is not a regular file")
     try:
-        return json.loads(path.read_text(encoding="utf-8"), parse_constant=no_constants)
+        with open(path, "rb") as f:
+            opened = os.fstat(f.fileno())
+            now = Path(os.path.realpath(path))
+            if not stat.S_ISREG(opened.st_mode) or not now.is_relative_to(root) or not os.path.samestat(opened, os.stat(now)):
+                raise ValueError(f"{path.name}: leaves the diff directory or is not a regular file")
+            raw = f.read()
+    except FileNotFoundError:
+        raise ValueError(f"{path.name}: does not exist") from None
+    except OSError as e:
+        raise ValueError(f"{path.name}: cannot be read ({type(e).__name__})") from None
+    try:
+        return json.loads(raw.decode("utf-8"), parse_constant=no_constants)
     except RecursionError:
         raise ValueError(f"{path.name}: JSON nested too deeply") from None
 
@@ -44,8 +83,26 @@ def _area_files(diff_dir: Path, area: dict) -> list[Path]:
         resolved = (root / name).resolve()
         if not resolved.is_relative_to(root):
             raise ValueError(f"area {area['id']}: file {name!r} leaves the diff directory")
+        if not resolved.exists():
+            raise ValueError(f"area {area['id']}: file {name!r} does not exist")
+        if not resolved.is_file():
+            raise ValueError(f"area {area['id']}: file {name!r} is not a regular file")
         files.append(resolved)
     return files
+
+
+def _check_required(entry, where: str) -> None:
+    """Every key the loader reads from an asset entry and its changes, so a short file is a ValueError."""
+    _need(entry, where, "path", "name", "type", "status", "paired_by", "old_path", "noise", "changes")
+    where = f"{where} {str(entry['path'])[:200]!r}"
+    for key in ("path", "name", "type"):
+        if not isinstance(entry[key], str):
+            raise ValueError(f"{where}: {key} must be a string")
+    _need(entry["noise"], f"{where} noise", *NOISE_KEYS)
+    for c in _list(entry["changes"], f"{where} changes"):
+        _need(c, f"{where} change", "path", "op", "before", "after")
+        if not isinstance(c["path"], str):
+            raise ValueError(f"{where}: change path must be a string")
 
 
 def _check_entry(entry: dict) -> None:
@@ -82,11 +139,19 @@ def _check_entry(entry: dict) -> None:
 def load_diff(diff_dir: Path) -> tuple[dict, list[tuple[str, dict]]]:
     """Return index.json and every (area id, asset entry). Large areas are split over several files.
     Everything is checked here, before the caller writes anything."""
-    index = _read_json(diff_dir / "index.json")
+    root = diff_dir.resolve()
+    index = _read_json(root, root / "index.json")
+    _need(index, "index.json", "areas", "totals")
+    _need(index["totals"], "index.json totals")
     entries = []
-    for area in index["areas"]:
-        for file in _area_files(diff_dir, area):
-            for entry in _read_json(file)["assets"]:
+    for i, area in enumerate(_list(index["areas"], "index.json: areas")):
+        _need(area, f"index.json area {i}", "id", "title", "file", "counts")
+        _need(area["counts"], f"index.json area {area['id']} counts")
+        for file in _area_files(root, area):
+            doc = _read_json(root, file)
+            _need(doc, file.name, "assets")
+            for entry in _list(doc["assets"], f"{file.name}: assets"):
+                _check_required(entry, f"{file.name} asset")
                 _check_entry(entry)
                 entries.append((area["id"], entry))
     return index, entries
@@ -100,6 +165,9 @@ def ingest(conn: Connection, diff_dir: Path, label: str, prev_label: str | None 
     if dupes:
         raise ValueError(f"assets listed more than once in the diff: {dupes[:5]}")
 
+    if manifest is not None:
+        _need(manifest, "manifest", "steam", "fingerprint")
+        _need(manifest["steam"], "manifest.steam", "buildid")
     values = {
         "prev_build_id": _ensure_build(conn, prev_label) if prev_label else None,
         "steam_buildid": manifest["steam"]["buildid"] if manifest else None,
