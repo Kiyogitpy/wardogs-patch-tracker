@@ -19,6 +19,7 @@ OLD = "Game/Old/AnimSet_Mosin.json"
 NEW = "Game/New/AnimSet_Mosin.json"
 ME = {"id": "80351110224678912", "username": "kiyo", "avatar": "abc123"}
 HEADERS = {"Origin": ORIGIN}
+SESSION, STATE = "__Host-session", "__Host-oauth_state"  # COOKIE_SECURE is on in these tests
 
 
 @pytest.fixture
@@ -115,7 +116,7 @@ def test_login_redirects_to_discord(client):
     assert q["client_id"] == "fake-client-id" and q["response_type"] == "code" and q["scope"] == "identify"
     assert q["redirect_uri"] == ORIGIN + "/api/auth/callback" and q["prompt"] == "none"
     assert "fake-client-secret" not in r.headers["location"]
-    assert client.cookies.get("oauth_state").startswith(q["state"] + ".")
+    assert client.cookies.get(STATE).startswith(q["state"] + ".")
 
 
 def test_full_flow(client, discord, world):
@@ -123,7 +124,7 @@ def test_full_flow(client, discord, world):
     assert r.status_code == 302 and r.headers["location"] == "/asset?path=x"
     token_call, me_call = discord["requests"]
     assert b"code=fake-code" in token_call.content and b"fake-client-secret" in token_call.content
-    assert "oauth_state" not in client.cookies
+    assert STATE not in client.cookies
 
     assert client.get("/api/me").json() == {
         "discord_id": ME["id"], "username": "kiyo",
@@ -146,7 +147,7 @@ def test_logout_when_signed_out(client):
 
 
 def test_database_stores_only_the_hash(user, world):
-    token = user.cookies.get("session")
+    token = user.cookies.get(SESSION)
     with world.connect() as conn:
         row = conn.execute(select(session)).one()
     assert row.token_hash == hashlib.sha256(token.encode()).hexdigest() and token != row.token_hash
@@ -156,7 +157,7 @@ def test_database_stores_only_the_hash(user, world):
 @pytest.mark.parametrize("variant", ["wrong_state", "no_state", "no_code", "nothing"])
 def test_bad_or_missing_state_creates_no_session(client, discord, world, variant):
     client.get("/api/auth/login")
-    good = client.cookies.get("oauth_state").split(".")[0]
+    good = client.cookies.get(STATE).split(".")[0]
     params = {"wrong_state": {"code": "c", "state": "wrong"}, "no_state": {"code": "c"},
               "no_code": {"state": good}, "nothing": {}}[variant]
     r = client.get("/api/auth/callback", params=params)
@@ -172,7 +173,7 @@ def test_callback_without_state_cookie(world, discord):
 
 def test_access_denied(client, discord, world):
     client.get("/api/auth/login")
-    state = client.cookies.get("oauth_state").split(".")[0]
+    state = client.cookies.get(STATE).split(".")[0]
     r = client.get("/api/auth/callback", params={"error": "access_denied", "state": state})
     assert r.headers["location"] == "/?signin=failed"
     assert count(world, "session") == 0 and discord["requests"] == []
@@ -191,7 +192,7 @@ def test_malformed_discord_profile_fails(client, discord, world):
 
 def test_state_cannot_be_replayed_by_another_client(client, discord, world):
     client.get("/api/auth/login")
-    state = client.cookies.get("oauth_state").split(".")[0]
+    state = client.cookies.get(STATE).split(".")[0]
     r = new_client().get("/api/auth/callback", params={"code": "c", "state": state})
     assert r.headers["location"] == "/?signin=failed" and count(world, "session") == 0
 
@@ -206,10 +207,10 @@ def test_open_redirects_become_root(client, discord, next_path):
 
 def test_tampered_next_in_cookie_is_revalidated(client, discord):
     client.get("/api/auth/login")
-    state = client.cookies.get("oauth_state").split(".")[0]
+    state = client.cookies.get(STATE).split(".")[0]
     evil = base64.urlsafe_b64encode(b"//evil.test").decode().rstrip("=")
     client.cookies.clear()
-    client.cookies.set("oauth_state", f"{state}.{evil}", path="/api/auth")
+    client.cookies.set(STATE, f"{state}.{evil}", path="/")
     r = client.get("/api/auth/callback", params={"code": "c", "state": state})
     assert r.status_code == 302 and r.headers["location"] == "/"
 
@@ -230,7 +231,7 @@ def test_expired_session_is_signed_out(user, world):
 
 
 def test_unknown_session_token_is_signed_out(client):
-    client.cookies.set("session", "not-a-real-token")
+    client.cookies.set(SESSION, "not-a-real-token")
     assert client.get("/api/me").status_code == 401
 
 
@@ -239,15 +240,21 @@ def test_cookie_flags(client, discord, monkeypatch, secure):
     if secure is not None:
         monkeypatch.setenv("COOKIE_SECURE", secure)
     expect_secure = secure != "0"
+    prefix = "__Host-" if expect_secure else ""  # the prefix needs Secure, so plain http dev keeps plain names
+    state_name, session_name = prefix + "oauth_state", prefix + "session"
     login = client.get("/api/auth/login")
-    state = cookie_attrs(login, "oauth_state")
-    assert state["httponly"] and state["samesite"].lower() == "lax" and state["path"] == "/api/auth"
+    state = cookie_attrs(login, state_name)
+    assert state["httponly"] and state["samesite"].lower() == "lax"
+    assert state["path"] == ("/" if expect_secure else "/api/auth") and "domain" not in state
     assert state["max-age"] == "600" and ("secure" in state) == expect_secure
     # The test client is https, so Secure cookies are sent back and the callback works in every case.
-    done = client.get("/api/auth/callback", params={"code": "c", "state": client.cookies.get("oauth_state").split(".")[0]})
-    sess = cookie_attrs(done, "session")
-    assert sess["httponly"] and sess["samesite"].lower() == "lax" and sess["path"] == "/"
+    done = client.get("/api/auth/callback", params={"code": "c", "state": client.cookies.get(state_name).split(".")[0]})
+    sess = cookie_attrs(done, session_name)
+    assert sess["httponly"] and sess["samesite"].lower() == "lax" and sess["path"] == "/" and "domain" not in sess
     assert sess["max-age"] == str(30 * 86400) and ("secure" in sess) == expect_secure
+    assert client.get("/api/me").status_code == 200
+    out = client.post("/api/auth/logout", headers=HEADERS)
+    assert cookie_attrs(out, session_name)["path"] == "/"
 
 
 # --- CSRF / content type ----------------------------------------------------------------------------------------
@@ -324,7 +331,7 @@ def test_invalid_subscriptions_are_422(user):
 @pytest.mark.parametrize("host", ["discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"])
 def test_webhook_hosts_accepted(user, host):
     r = post(user, webhook_url=f"https://{host}/api/webhooks/42/tok-en_X")
-    assert r.status_code == 201 and r.json()["webhook"] == f"https://{host}/api/webhooks/42/…en_X"
+    assert r.status_code == 201 and r.json()["webhook"] == "https://discord.com/api/webhooks/42/…en_X"
 
 
 @pytest.mark.parametrize("url", [
@@ -402,3 +409,56 @@ def test_disabled_at_is_reported(user, world):
         conn.execute(update(subscription).where(subscription.c.id == sub)
                      .values(disabled_at=datetime(2026, 11, 3, tzinfo=timezone.utc)))
     assert user.get("/api/subscriptions").json()[0]["disabled_at"] == "2026-11-03T00:00:00+00:00"
+
+
+# --- hardening --------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("username", ["ki\x00yo", "ki\nyo", "ki\x1fyo", "\x7fkiyo"])
+def test_control_characters_in_username_fail_sign_in(client, discord, world, username):
+    r = sign_in(client, discord, {**ME, "username": username})
+    assert r.status_code == 302 and r.headers["location"] == "/?signin=failed"
+    assert count(world, "app_user") == 0 and count(world, "session") == 0
+
+
+def test_login_deletes_every_users_expired_sessions(client, discord, world):
+    with world.begin() as conn:
+        conn.execute(text("INSERT INTO app_user (discord_id, username) VALUES ('2', 'other')"))
+        past = datetime.now(timezone.utc) - timedelta(days=1)
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        conn.execute(text("INSERT INTO session (token_hash, user_id, expires_at) VALUES "
+                          "('old-other', 1, :p), ('live-other', 1, :f)"), {"p": past, "f": future})
+    sign_in(client, discord)  # a different user (discord id 8035...) signs in
+    with world.connect() as conn:
+        hashes = set(conn.execute(select(session.c.token_hash)).scalars())
+    assert "old-other" not in hashes and "live-other" in hashes and len(hashes) == 2
+
+
+@pytest.mark.parametrize("host", ["discordapp.com", "ptb.discord.com", "canary.discord.com"])
+def test_webhook_aliases_are_stored_canonically_and_duplicate(user, world, host):
+    assert post(user).status_code == 201
+    r = post(user, webhook_url=f"https://{host}" + HOOK.removeprefix("https://discord.com"))
+    assert r.status_code == 409
+    with world.connect() as conn:
+        assert conn.execute(select(subscription.c.webhook_url)).scalars().all() == [HOOK]
+
+
+def test_alias_webhook_is_stored_as_discord_com(user, world):
+    assert post(user, webhook_url="https://ptb.discord.com/api/webhooks/42/tok-en_X").status_code == 201
+    with world.connect() as conn:
+        assert conn.execute(select(subscription.c.webhook_url)).scalar_one() == "https://discord.com/api/webhooks/42/tok-en_X"
+
+
+def test_callback_exchange_cap_redirects_at_once(client, discord, world, monkeypatch):
+    monkeypatch.setattr(accounts, "MAX_EXCHANGES", 1)
+    client.get("/api/auth/login")
+    state = client.cookies.get(STATE).split(".")[0]
+    monkeypatch.setattr(accounts, "_exchanges", 1)  # one exchange is already waiting on Discord
+    r = client.get("/api/auth/callback", params={"code": "c", "state": state})
+    assert r.status_code == 302 and r.headers["location"] == "/?signin=failed"
+    assert discord["requests"] == [] and count(world, "session") == 0
+    monkeypatch.setattr(accounts, "_exchanges", 0)  # the slot frees; a fresh attempt works
+    client.get("/api/auth/login")
+    state = client.cookies.get(STATE).split(".")[0]
+    r = client.get("/api/auth/callback", params={"code": "c", "state": state})
+    assert r.headers["location"] == "/" and count(world, "session") == 1
+    assert accounts._exchanges == 0

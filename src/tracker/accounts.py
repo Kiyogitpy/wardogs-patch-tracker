@@ -6,12 +6,14 @@ import hmac
 import os
 import re
 import secrets
+import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, exists, func, insert, select
@@ -19,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from tracker.db import app_user, asset, build, build_area, delivery, session, subscription
+from tracker.webhooks import canonical
 
 
 def _api():
@@ -36,9 +39,7 @@ SESSION_TTL = timedelta(days=30)
 STATE_TTL = 600
 MAX_SUBSCRIPTIONS = 25
 MAX_NEXT = 500
-WEBHOOK_RE = re.compile(
-    r"https://(?:discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)/api/webhooks/"
-    r"(\d{1,20})/([A-Za-z0-9_-]{1,100})", re.ASCII)
+MAX_EXCHANGES = 4  # concurrent Discord code exchanges; tests patch it
 AVATAR_RE = re.compile(r"[A-Za-z0-9_]{1,64}", re.ASCII)
 FAILED = "/?signin=failed"
 
@@ -54,6 +55,15 @@ def _public_origin() -> str:
 
 def _cookie_secure() -> bool:
     return os.environ.get("COOKIE_SECURE", "1") != "0"
+
+
+def cookie_name(base: str) -> str:
+    """The `__Host-` prefix (Secure, path "/", no Domain) when cookies are Secure; plain names for http dev."""
+    return ("__Host-" + base) if _cookie_secure() else base
+
+
+def _state_path() -> str:
+    return "/" if _cookie_secure() else "/api/auth"  # the prefix demands path "/"
 
 
 def _hash(token: str) -> str:
@@ -80,7 +90,7 @@ def _clear_cookie(response: Response, key: str, path: str) -> None:
 
 def _failed() -> RedirectResponse:
     response = RedirectResponse(FAILED, status_code=302)
-    _clear_cookie(response, "oauth_state", "/api/auth")
+    _clear_cookie(response, cookie_name("oauth_state"), _state_path())
     return response
 
 
@@ -94,7 +104,7 @@ def login(next: str | None = None):
     query = urlencode({"client_id": client_id, "redirect_uri": _public_origin() + "/api/auth/callback",
                        "response_type": "code", "scope": "identify", "state": state, "prompt": "none"})
     response = RedirectResponse(f"{DISCORD_AUTHORIZE}?{query}", status_code=302)
-    _set_cookie(response, "oauth_state", f"{state}.{packed}", STATE_TTL, "/api/auth")
+    _set_cookie(response, cookie_name("oauth_state"), f"{state}.{packed}", STATE_TTL, _state_path())
     return response
 
 
@@ -128,20 +138,38 @@ def _discord_user(code: str) -> dict | None:
         return None
     if (not isinstance(profile, dict) or not isinstance(profile.get("id"), str)
             or not re.fullmatch(r"\d{1,20}", profile["id"], re.ASCII)
-            or not isinstance(profile.get("username"), str) or not profile["username"]):
+            or not isinstance(profile.get("username"), str) or not profile["username"]
+            or any(unicodedata.category(c) == "Cc" for c in profile["username"])):  # NUL would be a 500 in Postgres
         return None
     avatar = profile.get("avatar")
     return {"discord_id": profile["id"], "username": profile["username"][:200],
             "avatar": avatar if isinstance(avatar, str) and AVATAR_RE.fullmatch(avatar) else None}
 
 
+_exchanges = 0
+_exchanges_lock = threading.Lock()
+
+
+def _exchange(code: str) -> dict | None:
+    """_discord_user, but at most MAX_EXCHANGES at once; over the cap it fails at once instead of queueing."""
+    global _exchanges
+    with _exchanges_lock:
+        if _exchanges >= MAX_EXCHANGES:
+            return None
+        _exchanges += 1
+    try:
+        return _discord_user(code)
+    finally:
+        with _exchanges_lock:
+            _exchanges -= 1
+
+
 @router.get("/auth/callback")
-def callback(code: str | None = None, state: str | None = None, error: str | None = None,
-             oauth_state: Annotated[str | None, Cookie()] = None):
-    next_path = _parse_state_cookie(oauth_state, state)
+def callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+    next_path = _parse_state_cookie(request.cookies.get(cookie_name("oauth_state")), state)
     if error or next_path is None or not code or len(code) > 512 or not _public_origin():
         return _failed()
-    user = _discord_user(code)
+    user = _exchange(code)
     if user is None:
         return _failed()
     token = secrets.token_urlsafe(32)
@@ -152,26 +180,28 @@ def callback(code: str | None = None, state: str | None = None, error: str | Non
                                    set_={"username": user["username"], "avatar": user["avatar"],
                                          "last_login_at": func.now()})
             .returning(app_user.c.id)).scalar_one()
-        conn.execute(delete(session).where(session.c.user_id == user_id, session.c.expires_at <= func.now()))
+        conn.execute(delete(session).where(session.c.expires_at <= func.now()))  # everyone's, so the table stays small
         conn.execute(insert(session).values(token_hash=_hash(token), user_id=user_id,
                                             expires_at=datetime.now(timezone.utc) + SESSION_TTL))
     response = RedirectResponse(next_path, status_code=302)
-    _clear_cookie(response, "oauth_state", "/api/auth")
-    _set_cookie(response, "session", token, int(SESSION_TTL.total_seconds()), "/")
+    _clear_cookie(response, cookie_name("oauth_state"), _state_path())
+    _set_cookie(response, cookie_name("session"), token, int(SESSION_TTL.total_seconds()), "/")
     return response
 
 
 @router.post("/auth/logout", status_code=204)
-def logout(session_token: Annotated[str | None, Cookie(alias="session")] = None):
+def logout(request: Request):
+    session_token = request.cookies.get(cookie_name("session"))
     if session_token:
         with _api().get_engine().begin() as conn:
             conn.execute(delete(session).where(session.c.token_hash == _hash(session_token)))
     response = Response(status_code=204)
-    _clear_cookie(response, "session", "/")
+    _clear_cookie(response, cookie_name("session"), "/")
     return response
 
 
-def current_user(session_token: Annotated[str | None, Cookie(alias="session")] = None):
+def current_user(request: Request):
+    session_token = request.cookies.get(cookie_name("session"))
     if session_token:
         with _api().get_engine().connect() as conn:
             row = conn.execute(
@@ -245,7 +275,8 @@ class SubscriptionIn(BaseModel):
 @router.post("/subscriptions", status_code=201)
 def create_subscription(body: SubscriptionIn, user: User, response: Response):
     response.headers.update(NO_STORE)
-    if len(body.webhook_url) > 300 or not WEBHOOK_RE.fullmatch(body.webhook_url):
+    webhook = canonical(body.webhook_url) if len(body.webhook_url) <= 300 else None
+    if webhook is None:
         raise HTTPException(422, "webhook_url must be a Discord webhook URL")
     if body.kind == "asset":
         if (body.target is not None or not body.asset_path or len(body.asset_path) > 1000
@@ -256,7 +287,7 @@ def create_subscription(body: SubscriptionIn, user: User, response: Response):
         raise HTTPException(422, f"{body.kind} subscriptions need a valid target (and no asset_path)")
 
     with _api().get_engine().begin() as conn:
-        values = {"user_id": user.id, "kind": body.kind, "webhook_url": body.webhook_url}
+        values = {"user_id": user.id, "kind": body.kind, "webhook_url": webhook}
         if body.kind == "asset":
             found = _api().resolve_asset(conn, body.asset_path)
             if found is None:
