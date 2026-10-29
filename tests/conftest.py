@@ -35,3 +35,12 @@ def db(engine):
 @pytest.fixture
 def fixtures():
     return Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def no_rate_limit(monkeypatch):
+    """The suite makes far more requests from one IP than production allows; the limiter tests set real limits."""
+    from tracker import api
+    monkeypatch.setattr(api, "RATE_AUTH", (10**9, 10**9))
+    monkeypatch.setattr(api, "RATE_API", (10**9, 10**9))
+    api._buckets.clear()
