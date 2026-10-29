@@ -22,7 +22,9 @@ def conn_args(url):
 
 
 PLACEHOLDERS = {"", "change-me", "changeme", "password"}
-MAX_CONNECTIONS = 20
+# -1 = no per-role limit. A limit was tried and dropped: on Postgres 16.15 a burst past a role's limit
+# crash-restarted the whole server, so the limit itself was a DoS. Load is bounded by the pools and timeouts.
+MAX_CONNECTIONS = -1
 
 
 def bad_password(password) -> bool:

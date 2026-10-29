@@ -113,7 +113,9 @@ Two roles, two URLs:
 
 - No `TEMP` privilege (revoked from `PUBLIC` and from the role): it cannot create temporary tables.
 - `statement_timeout = 5s` as the role default, so a runaway query in `tracker ingest`/`notify` or an ad-hoc session is cancelled. A session may still `SET statement_timeout` itself (the API sets its own value), so this guards against accidents, not against a compromised app.
-- `CONNECTION LIMIT 20`, above the API pool's maximum (15) plus a CLI run. Keep it above your pool size: on Postgres 16.15 (Docker) a burst of simultaneous connections beyond a role's limit made the postmaster crash-restart the whole server (a backend exited with code 2, observed with a plain test role too), so never aim load tools at this role.
+- No per-role `CONNECTION LIMIT` (`-1`): on Postgres 16.15 a burst of connections past a role's limit crash-restarted
+  the whole server, so a limit would itself be a denial of service. Connections are bounded by the API pool (15), the
+  CLI runs and the statement timeouts instead.
 - The script refuses empty, whitespace-only and placeholder passwords (`change-me`, `changeme`, `password`, any case) for both roles, and a role name equal to the owner, `postgres` or `pg_*`.
 - The password is sent as a SCRAM verifier, and the session turns statement logging off (`log_min_error_statement = panic`, `log_statement = none`), so a failed `CREATE`/`ALTER ROLE` cannot leave the plaintext in the Postgres log.
 
