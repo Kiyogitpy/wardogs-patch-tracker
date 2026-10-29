@@ -1,4 +1,8 @@
 {
+	# The container healthcheck polls the admin API every 30s; keep those requests out of the log.
+	log {
+		exclude admin.api
+	}
 	servers :443 {
 		timeouts {
 			read_header 10s

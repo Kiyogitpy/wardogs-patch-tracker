@@ -31,9 +31,12 @@
 		max_size 64KB
 	}
 
+	# Only the exact lower-case /api prefix reaches Python (path_regexp is case-sensitive, unlike `path`,
+	# which would also match /API/x and send it to the app's static fallback with no rate limit). Other
+	# case variants fall through to the static SPA fallback below. Same rule as _is_api in server.py.
 	# Only /api reaches Python. Everything else is served from the copy of web/dist baked into
 	# the Caddy image (/srv), so a static-file flood never queues behind the app.
-	@api path /api /api/*
+	@api path_regexp ^/api(/|$)
 	handle @api {
 		reverse_proxy app:8000 {
 			# One address only: the client as Caddy sees it (see Caddyfile.pi for the trusted hop).
@@ -44,7 +47,10 @@
 
 	handle /assets/* {
 		# Hashed file names: cache for a year. A missing asset is a plain 404, never index.html.
-		header Cache-Control "public, max-age=31536000, immutable"
+		# Not on a trailing-slash request: for a file, file_server answers that with a 308 redirect, which must
+		# not be cached for a year.
+		@hashed not path */
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
 		root * /srv
 		file_server
 	}
