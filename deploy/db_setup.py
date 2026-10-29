@@ -3,8 +3,8 @@
 1. `alembic upgrade head` as the owner role (MIGRATE_DATABASE_URL).
 2. Create or update the restricted role named in DATABASE_URL (default `tracker_app`) and grant it
    DML only: SELECT/INSERT/UPDATE/DELETE on tables, USAGE on sequences, same for future tables
-   (the owner's default privileges). No DDL, no superuser, no access to alembic_version, no TEMP,
-   at most 20 connections, statement_timeout 5s.
+   (the owner's default privileges). No DDL, no superuser, no access to alembic_version, no TEMP, no CONNECT to the postgres and template1
+   databases, at most 20 connections, statement_timeout 5s.
 
 Idempotent: safe to run on every deploy. The owner's credentials never reach the `app` service.
 """
@@ -88,6 +88,10 @@ def main() -> int:
             "REVOKE ALL ON alembic_version FROM {role}",
         ):
             conn.execute(sql.SQL(stmt).format(role=role, db=db))
+        # PUBLIC may connect to and create temp tables in the maintenance databases by default; that would
+        # let tracker_app create temp tables and large objects there. The owner keeps access as superuser.
+        for maint in ("postgres", "template1"):
+            conn.execute(sql.SQL("REVOKE CONNECT, TEMP ON DATABASE {} FROM PUBLIC").format(sql.Identifier(maint)))
     print(f"migrations applied; role {app.username} has DML-only access", flush=True)
     return 0
 
