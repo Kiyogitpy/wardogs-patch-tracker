@@ -29,7 +29,6 @@ MAX_FOOTER = 2048
 MAX_URL = 2048
 MAX_EMBED = 6000  # Discord counts title + description + footer text
 HUGE = 1e300  # numbers at or beyond this are shown as plain values, not subtracted
-MAX_LINE = 400  # keeps ten lines plus the "and N more" line near the description limit
 MAX_ERROR = 300
 ATTEMPTS = 3
 BACKOFF = (1, 4)
@@ -88,8 +87,21 @@ def _delta(before, after) -> str | None:
     return f"({text}, {pct})"
 
 
+def u16(text: str) -> int:
+    """Length in UTF-16 code units, which is how Discord counts every embed limit (an emoji is 2)."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def _cut(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    """At most `limit` UTF-16 units, ending in "…" when cut; a surrogate pair is never split."""
+    if u16(text) <= limit:
+        return text
+    used = 0
+    for i, c in enumerate(text):
+        used += 2 if ord(c) > 0xFFFF else 1
+        if used > limit - 1:
+            return text[:i] + "…"
+    return text
 
 
 # ---------- Discord Markdown safety ----------
@@ -100,8 +112,21 @@ _SPECIAL = re.compile(r"([\\*_~|>\[\]()#<`])")
 _LIST_START = re.compile(r"^(\s*)(?:([-+])|(\d+)\.)")
 
 
+ZWSP = "\N{ZERO WIDTH SPACE}"  # zero-width space: the one format character we add ourselves, after the game text is cleaned
+_DOT = re.compile(r"(?<=\w)[.\N{IDEOGRAPHIC FULL STOP}\N{FULLWIDTH FULL STOP}\N{HALFWIDTH IDEOGRAPHIC FULL STOP}](?=\w)")  # ASCII, ideographic, fullwidth and halfwidth dots
+
+
 def _oneline(text: str) -> str:
-    return "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in text)
+    """One line: line breaks and control characters become spaces; format characters (category Cf: bidi
+    overrides and isolates, joiners, BOM, soft hyphen) are dropped."""
+    out = []
+    for c in text:
+        category = unicodedata.category(c)
+        if category in ("Cc", "Zl", "Zp"):
+            out.append(" ")
+        elif category != "Cf":
+            out.append(c)
+    return "".join(out)
 
 
 def md(text: str, limit: int = 10_000) -> str:
@@ -109,7 +134,8 @@ def md(text: str, limit: int = 10_000) -> str:
     syntax, and no clickable bare URL."""
     text = _SPECIAL.sub(r"\\\1", _cut(_oneline(text), limit))
     text = _LIST_START.sub(lambda m: m[1] + (f"\\{m[2]}" if m[2] else f"{m[3]}\\."), text)
-    return text.replace("://", ":\\/\\/")
+    text = text.replace("://", ":\\/\\/")
+    return _DOT.sub(lambda m: m[0] + ZWSP, text)  # evil.com, discord.gg/x: not a domain Discord will link
 
 
 def code(text: str, limit: int = MAX_VALUE) -> str:
@@ -148,7 +174,7 @@ def description(lines: list[str], total: int, link: str, limit: int = MAX_DESCRI
     while True:
         more = total - len(shown)
         text = "\n".join(shown + ([f"and {more} more: {link}"] if more > 0 else []))
-        if len(text) <= limit or not shown:
+        if u16(text) <= limit or not shown:
             return _cut(text, limit)
         shown.pop()
 
@@ -157,7 +183,7 @@ def _embed(title: str, url: str, lines: list[str], total: int, footer: str, fall
     title, footer = _cut(title, MAX_TITLE), _cut(_oneline(footer), MAX_FOOTER)
     if len(url) > MAX_URL:  # a very long asset path: link to the build page instead
         url = fallback
-    budget = min(MAX_DESCRIPTION, MAX_EMBED - len(title) - len(footer))
+    budget = min(MAX_DESCRIPTION, MAX_EMBED - u16(title) - u16(footer))
     return {
         "username": "Wardogs Patch Tracker",
         "allowed_mentions": {"parse": []},

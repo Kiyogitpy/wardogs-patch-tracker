@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import unicodedata
 from datetime import date
 
 import httpx
@@ -96,8 +97,8 @@ def test_asset_subscription_follows_move(conn_db):
     h.run(conn_db, "b1")
     h.run(conn_db, "b2")
     b1, b2 = h.bodies()
-    assert b1["embeds"][0]["title"] == "AnimSet\_Mosin changed in b1"
-    assert b2["embeds"][0]["title"] == "AnimSet\_Mosin moved in b2"
+    assert b1["embeds"][0]["title"] == r"AnimSet\_Mosin changed in b1"
+    assert b2["embeds"][0]["title"] == r"AnimSet\_Mosin moved in b2"
     assert b2["embeds"][0]["url"] == ORIGIN + "/asset?path=Game%2FNew%2FAnimSet_Mosin.json"
 
 
@@ -109,7 +110,7 @@ def test_area_subscription(conn_db):
     e = h.bodies()[0]["embeds"][0]
     assert e["title"] == "Vehicles changed in b2"
     assert e["url"] == ORIGIN + "/builds/b2?area=vehicles"
-    assert e["description"] == "2 modified\nmodified  DA\_Jeep\nmodified  DA\_Truck"
+    assert e["description"] == "2 modified\n" r"modified  DA\_Jeep" "\n" r"modified  DA\_Truck"
     assert e["footer"]["text"] == "Watching: area vehicles"
 
 
@@ -123,7 +124,7 @@ def test_field_subscription_case_insensitive_and_literal_wildcards(conn_db):
     e = h.bodies()[0]["embeds"][0]
     assert e["title"] == "1 change matching “basedamage” in b2"
     assert e["url"] == ORIGIN + "/changes?field=basedamage&build=b2"
-    assert e["description"] == "**DA\_Rifle**  `Properties.BaseDamage`  40 ▶ 45  (+5, +13%)"
+    assert e["description"] == r"**DA\_Rifle**  `Properties.BaseDamage`  40 ▶ 45  (+5, +13%)"
 
 
 def test_no_match_no_row(conn_db):
@@ -142,7 +143,7 @@ def test_exact_message(conn_db):
         "username": "Wardogs Patch Tracker",
         "allowed_mentions": {"parse": []},
         "embeds": [{
-            "title": "DA\_Rifle changed in b2",
+            "title": r"DA\_Rifle changed in b2",
             "url": ORIGIN + "/asset?path=Game%2FWeapons%2FDA_Rifle.json",
             "description": "Status: modified\n`Properties.BaseDamage`  40 ▶ 45  (+5, +13%)\n"
                            "`Properties.Tags[2]`  `null` ▶ `\"Tag.X\"`",
@@ -544,3 +545,99 @@ def test_invalid_stored_webhook_is_not_called_and_is_disabled(conn_db):
     assert rows[bad].status == "failed" and rows[bad].last_error == "invalid webhook" and rows[bad].attempts == 0
     assert disabled(conn_db, bad) is not None and disabled(conn_db, good) is None
     assert (s["sent"], s["failed"], s["disabled"]) == (1, 1, 1)
+
+
+# ---------- text hardening: domains, UTF-16 budgets, format characters ----------
+
+ZWSP = "\N{ZERO WIDTH SPACE}"
+
+
+def u16(text_: str) -> int:
+    return len(text_.encode("utf-16-le")) // 2
+
+
+@pytest.mark.parametrize("name", [
+    "evil.com/login", "discord.gg/abc", "www.evil.com", "evil.com", "a.b.c/d", "xn--bcher-kva.example",
+    "bücher.de/x", "例え.jp", "x.y", "see evil.com. now", "a..b", "(evil.com)",
+])
+def test_md_makes_bare_domains_unlinkable(name):
+    from tracker.notify import md
+    out = md(name)
+    # No two word characters are left on either side of a dot: nothing for Discord to autolink.
+    assert not re.search(r"\w\.\w", out), out
+    assert out.replace(ZWSP, "").replace("\\", "") == name  # only zero-width spaces (and escapes) were added
+
+
+def test_md_domain_output_stays_readable():
+    from tracker.notify import md
+    assert md("evil.com/login") == "evil." + ZWSP + "com/login"
+    assert md("a.b.c/d") == "a." + ZWSP + "b." + ZWSP + "c/d"
+    assert md("Mk. 2 and v1.5") == "Mk. 2 and v1." + ZWSP + "5"
+
+
+def test_embed_budgets_count_utf16_units(conn_db):
+    from tracker.notify import _cut
+    # 130 emoji: 130 characters but 260 UTF-16 units, over Discord's 256 for a title.
+    name = "😀" * 130
+    assert len(name) < 256 < u16(name)
+    assert u16(_cut(name, 256)) <= 256 and u16(_cut(name, 10)) == 9  # never half a surrogate pair
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE asset SET name = :n WHERE name = 'DA_Rifle'"), {"n": name})
+    subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json")
+    h = Hook()
+    h.run(conn_db)
+    e = h.bodies()[0]["embeds"][0]
+    assert u16(e["title"]) <= 256 and u16(e["footer"]["text"]) <= 2048 and u16(e["description"]) <= 4096
+    assert u16(e["title"]) + u16(e["description"]) + u16(e["footer"]["text"]) <= 6000
+
+
+def test_emoji_heavy_description_and_total_fit_in_utf16(conn_db):
+    name = "😀" * 20_000
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE asset SET name = :n WHERE name = 'DA_Rifle'"), {"n": name})
+        conn.execute(text("UPDATE build_area SET title = :n WHERE area = 'vehicles'"), {"n": name})
+    subscribe(conn_db, "area", "weapons-ammo")
+    subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json", hook=HOOK + "2")
+    h = Hook()
+    h.run(conn_db)
+    for body in h.bodies():
+        e = body["embeds"][0]
+        assert u16(e["title"]) <= 256 and u16(e["footer"]["text"]) <= 2048 and u16(e["description"]) <= 4096
+        assert u16(e["title"]) + u16(e["description"]) + u16(e["footer"]["text"]) <= 6000
+
+
+def test_description_limit_is_in_utf16_units():
+    line = "😀" * 150  # 300 units
+    out = description([line] * 10, 10, "https://x/y", limit=4096)
+    assert u16(out) <= 4096 and out.count(line) == 10
+    out = description([line] * 10, 10, "https://x/y", limit=1000)
+    assert u16(out) <= 1000
+
+
+@pytest.mark.parametrize("bad", ["\N{RIGHT-TO-LEFT OVERRIDE}", "\N{LEFT-TO-RIGHT ISOLATE}", "\N{RIGHT-TO-LEFT ISOLATE}", "\N{FIRST STRONG ISOLATE}", "\N{POP DIRECTIONAL ISOLATE}", "\N{ZERO WIDTH JOINER}", "\N{LEFT-TO-RIGHT MARK}", "\N{ZERO WIDTH NO-BREAK SPACE}", "\N{SOFT HYPHEN}"])
+def test_format_characters_are_stripped(bad):
+    from tracker.notify import code, md
+    assert md(f"ab{bad}cd") == "abcd" and code(f"ab{bad}cd") == "`abcd`"
+    assert md(f"a{ZWSP}b.c") == "ab." + ZWSP + "c"  # their zero-width space goes, ours stays
+
+
+def test_bidi_override_in_game_text_does_not_reach_the_message(conn_db):
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE asset SET name = :n WHERE name = 'DA_Rifle'"), {"n": "gpj.\N{RIGHT-TO-LEFT OVERRIDE}exe"})
+    subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json")
+    h = Hook()
+    h.run(conn_db)
+    e = h.bodies()[0]["embeds"][0]
+    assert not any(unicodedata.category(c) == "Cf" and c != ZWSP for c in json.dumps(e, ensure_ascii=False))
+
+
+def test_md_fuzz_never_leaves_a_linkable_domain_or_a_format_character():
+    import random
+    from tracker.notify import md
+    rng = random.Random(7)
+    alphabet = ["a", "b", "Z", "9", "-", "_", ".", ".", "/", ":", " ", "é", "例", "😀", "\N{RIGHT-TO-LEFT OVERRIDE}",
+                "\N{ZERO WIDTH SPACE}", "\N{FULLWIDTH FULL STOP}", "://", "xn--", "www.", "discord.gg/"]
+    for _ in range(2000):
+        out = md("".join(rng.choice(alphabet) for _ in range(rng.randint(0, 30))))
+        assert not re.search(r"\w[.\N{IDEOGRAPHIC FULL STOP}\N{FULLWIDTH FULL STOP}\N{HALFWIDTH IDEOGRAPHIC FULL STOP}]\w", out), out
+        assert "\N{RIGHT-TO-LEFT OVERRIDE}" not in out and "://" not in out
