@@ -13,9 +13,11 @@ URL = make_url(os.environ.get("TEST_DATABASE_URL", "postgresql+psycopg://tracker
 @pytest.fixture(scope="session")
 def engine():
     """A fresh database built by the migrations, so the tests also prove the migrations."""
-    with create_engine(URL.set(database="postgres"), isolation_level="AUTOCOMMIT").connect() as admin:
+    admin_engine = create_engine(URL.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as admin:
         admin.execute(text(f'DROP DATABASE IF EXISTS "{URL.database}" WITH (FORCE)'))
         admin.execute(text(f'CREATE DATABASE "{URL.database}"'))
+    admin_engine.dispose()
     config = Config(ROOT / "alembic.ini")
     config.attributes["url"] = URL.render_as_string(hide_password=False)
     command.upgrade(config, "head")
