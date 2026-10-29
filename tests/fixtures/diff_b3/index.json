@@ -1,0 +1,38 @@
+{
+ "from": {
+  "label": "Season 1"
+ },
+ "to": {
+  "label": "Season 2"
+ },
+ "generated_by": "_tools/season_diff.py",
+ "totals": {
+  "assets_added": 0,
+  "assets_removed": 0,
+  "assets_modified": 2,
+  "assets_moved": 0,
+  "noise_only_assets": 0,
+  "property_changes": 2,
+  "removed_values": 0,
+  "noise_renamed_keys": 0,
+  "noise_ref_shifts": 0,
+  "noise_dup_keys": 0,
+  "noise_swapped_keys": 0,
+  "noise_type_reinterpret": 0
+ },
+ "areas": [
+  {
+   "id": "weapons-ammo",
+   "title": "Weapons & Ammo",
+   "file": "weapons-ammo.json",
+   "counts": {
+    "added": 0,
+    "removed": 0,
+    "modified": 2,
+    "moved": 0,
+    "property_changes": 2,
+    "removed_values": 0
+   }
+  }
+ ]
+}
