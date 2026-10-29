@@ -1,12 +1,17 @@
 """Read-only JSON API over the ingested builds. See docs/API.md."""
+import json
+import math
 import os
-from collections import defaultdict
+import time
+from collections import OrderedDict, defaultdict
 from functools import cache
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from psycopg.errors import QueryCanceled
 from sqlalchemy import Engine, case, create_engine, exists, func, select
+from sqlalchemy.exc import DBAPIError
 
 from tracker.db import asset, asset_alias, asset_status, build, build_area, change
 
@@ -24,6 +29,82 @@ STATUS_ORDER = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value
 
 app = FastAPI(title="Wardogs patch tracker")
 
+MAX_BODY = 64 * 1024  # bytes of request body accepted under /api
+STATEMENT_TIMEOUT_MS = 3000  # per statement, API engine only (ingest and notify use their own engines)
+# Token buckets per client IP: (requests per minute, burst). Tests patch these.
+RATE_AUTH = (10, 5)
+RATE_API = (120, 60)
+MAX_BUCKETS = 10_000
+BUCKET_IDLE = 600.0  # seconds without a request before a bucket is dropped
+_buckets: OrderedDict[tuple[str, str], list[float]] = OrderedDict()  # key -> [tokens, last seen], oldest first
+_now = time.monotonic
+
+
+def _take(ip: str, group: str, per_minute: int, burst: int) -> float:
+    """Spend one token; returns 0 when allowed, else the seconds until one is available."""
+    now = _now()
+    key = (ip, group)
+    tokens, last = _buckets.pop(key, (float(burst), now))
+    tokens = min(float(burst), tokens + (now - last) * per_minute / 60)
+    allowed = tokens >= 1
+    _buckets[key] = [tokens - 1 if allowed else tokens, now]  # re-inserted last: the dict is ordered by recency
+    while _buckets and (len(_buckets) > MAX_BUCKETS or now - next(iter(_buckets.values()))[1] > BUCKET_IDLE):
+        _buckets.popitem(last=False)
+    return 0.0 if allowed else (1 - tokens) * 60 / per_minute
+
+
+async def _reply(send, status: int, detail: str, headers: list[tuple[bytes, bytes]] = ()) -> None:
+    body = json.dumps({"detail": detail}).encode()
+    await send({"type": "http.response.start", "status": status, "headers": [
+        (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *headers]})
+    await send({"type": "http.response.body", "body": body})
+
+
+class Guard:
+    """Pure ASGI middleware, outermost, so it runs before auth and before any body is buffered: per-IP rate
+    limit, then a cap on request bodies (Content-Length up front, streamed bytes for chunked requests)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not (path == "/api" or path.startswith("/api/")):
+            return await self.app(scope, receive, send)
+        ip = (scope.get("client") or ("unknown",))[0]
+        per_minute, burst = RATE_AUTH if path.startswith("/api/auth/") else RATE_API
+        wait = _take(ip, "auth" if path.startswith("/api/auth/") else "api", per_minute, burst)
+        if wait:
+            return await _reply(send, 429, "too many requests", [(b"retry-after", str(math.ceil(wait)).encode())])
+        declared = dict(scope["headers"]).get(b"content-length", b"0")
+        if declared.isdigit() and int(declared) > MAX_BODY:
+            return await _reply(send, 413, "request body too large")
+
+        seen = 0
+        rejected = False
+
+        async def counted_receive():
+            nonlocal seen, rejected
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > MAX_BODY and not rejected:
+                    rejected = True
+                    await _reply(send, 413, "request body too large")
+                if rejected:  # stop reading: the app sees the client go away
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message):
+            if not rejected:
+                await send(message)
+
+        try:
+            await self.app(scope, counted_receive, guarded_send)
+        except Exception:
+            if not rejected:
+                raise
+
 
 @app.middleware("http")
 async def check_origin(request: Request, call_next):
@@ -40,9 +121,20 @@ async def check_origin(request: Request, call_next):
     return await call_next(request)
 
 
+app.add_middleware(Guard)  # added after check_origin, so it wraps it
+
+
+@app.exception_handler(DBAPIError)
+async def slow_query(request: Request, exc: DBAPIError):
+    if not isinstance(exc.orig, QueryCanceled):
+        raise exc
+    return JSONResponse({"detail": "query took too long, narrow the search"}, status_code=503)
+
+
 @cache
 def get_engine() -> Engine:
-    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True,
+                         connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"})
 
 
 def _build_json(row, counts: list[dict]) -> dict:

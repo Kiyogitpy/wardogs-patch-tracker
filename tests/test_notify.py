@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import date
 
 import httpx
@@ -7,6 +8,7 @@ import pytest
 from sqlalchemy import text
 
 from tracker import cli
+from tracker import notify as notify_mod
 from tracker.ingest import ingest
 from tracker.notify import UnknownBuild, change_line, description, notify
 
@@ -94,8 +96,8 @@ def test_asset_subscription_follows_move(conn_db):
     h.run(conn_db, "b1")
     h.run(conn_db, "b2")
     b1, b2 = h.bodies()
-    assert b1["embeds"][0]["title"] == "AnimSet_Mosin changed in b1"
-    assert b2["embeds"][0]["title"] == "AnimSet_Mosin moved in b2"
+    assert b1["embeds"][0]["title"] == "AnimSet\_Mosin changed in b1"
+    assert b2["embeds"][0]["title"] == "AnimSet\_Mosin moved in b2"
     assert b2["embeds"][0]["url"] == ORIGIN + "/asset?path=Game%2FNew%2FAnimSet_Mosin.json"
 
 
@@ -107,7 +109,7 @@ def test_area_subscription(conn_db):
     e = h.bodies()[0]["embeds"][0]
     assert e["title"] == "Vehicles changed in b2"
     assert e["url"] == ORIGIN + "/builds/b2?area=vehicles"
-    assert e["description"] == "2 modified\nmodified  DA_Jeep\nmodified  DA_Truck"
+    assert e["description"] == "2 modified\nmodified  DA\_Jeep\nmodified  DA\_Truck"
     assert e["footer"]["text"] == "Watching: area vehicles"
 
 
@@ -121,7 +123,7 @@ def test_field_subscription_case_insensitive_and_literal_wildcards(conn_db):
     e = h.bodies()[0]["embeds"][0]
     assert e["title"] == "1 change matching “basedamage” in b2"
     assert e["url"] == ORIGIN + "/changes?field=basedamage&build=b2"
-    assert e["description"] == "**DA_Rifle**  `Properties.BaseDamage`  40 ▶ 45  (+5, +13%)"
+    assert e["description"] == "**DA\_Rifle**  `Properties.BaseDamage`  40 ▶ 45  (+5, +13%)"
 
 
 def test_no_match_no_row(conn_db):
@@ -140,10 +142,10 @@ def test_exact_message(conn_db):
         "username": "Wardogs Patch Tracker",
         "allowed_mentions": {"parse": []},
         "embeds": [{
-            "title": "DA_Rifle changed in b2",
+            "title": "DA\_Rifle changed in b2",
             "url": ORIGIN + "/asset?path=Game%2FWeapons%2FDA_Rifle.json",
             "description": "Status: modified\n`Properties.BaseDamage`  40 ▶ 45  (+5, +13%)\n"
-                           "`Properties.Tags[2]`  null ▶ \"Tag.X\"",
+                           "`Properties.Tags[2]`  `null` ▶ `\"Tag.X\"`",
             "footer": {"text": "Watching: asset DA_Rifle"},
         }],
     }]
@@ -168,9 +170,9 @@ def test_number_formats():
     assert line(0.1, 0.30000000000000004) == "0.1 ▶ 0.3  (+0.2, +200%)"
     assert line(1000, 1001) == "1000 ▶ 1001  (+1, +0.1%)"
     assert line(100000, 100001) == "100000 ▶ 100001  (+1, +<0.1%)"
-    assert line(True, False) == "true ▶ false"
-    assert line(None, "x" * 100) == 'null ▶ "' + "x" * 78 + "…"
-    assert line([1, 2], {"a": 1}) == '[1,2] ▶ {"a":1}'
+    assert line(True, False) == "`true` ▶ `false`"
+    assert line(None, "x" * 100) == "`null` ▶ `\"" + "x" * 78 + "…`"
+    assert line([1, 2], {"a": 1}) == '`[1,2]` ▶ `{"a":1}`'
 
 
 def test_truncation_with_more(conn_db):
@@ -206,7 +208,7 @@ def test_long_title_cut(conn_db):
     h = Hook()
     h.run(conn_db)
     title = h.bodies()[0]["embeds"][0]["title"]
-    assert len(title) == 256 and title.endswith("…")
+    assert len(title) <= 256 and "x…”" in title
 
 
 def test_everyone_in_game_string_does_not_ping(conn_db):
@@ -416,3 +418,129 @@ def test_webhook_url_never_in_errors_logs_or_output(conn_db, caplog):
     for blob in errors + [caplog.text]:
         assert "SECRET" not in blob and "discord.com" not in blob
     assert "subscription 1" in caplog.text
+
+
+# ---------- hardening ----------
+
+def bare(text_: str) -> str:
+    """What is left once code spans and backslash escapes are removed: it must hold no Markdown syntax."""
+    text_ = re.sub(r"`[^`\n]*`", "", text_)
+    return re.sub(r"\\.", "", text_)
+
+
+def test_poison_numbers_do_not_stop_the_run(conn_db):
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE change SET before = '1e308'::jsonb, after = '-1e308'::jsonb "
+                          "WHERE field_path = 'Properties.BaseDamage'"))
+        conn.execute(text("INSERT INTO change (build_id, asset_id, field_path, op, before, after) "
+                          "SELECT b.id, a.id, 'Big', 'changed', ('1' || repeat('0', 400))::jsonb, '5'::jsonb "
+                          "FROM build b, asset a WHERE b.label = 'b2' AND a.name = 'DA_Rifle'"))
+    subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json")
+    subscribe(conn_db, "area", "vehicles", hook=HOOK + "2")
+    h = Hook()
+    s = h.run(conn_db)
+    assert (s["sent"], s["failed"]) == (2, 0)
+    assert [r.status for r in delivery_rows(conn_db)] == ["sent", "sent"]
+    desc = h.bodies()[0]["embeds"][0]["description"]
+    assert "BaseDamage" in desc and "▶" in desc
+
+
+def test_one_broken_subscription_does_not_stop_the_others(conn_db, monkeypatch, caplog):
+    bad = subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json")
+    good = subscribe(conn_db, "area", "vehicles", hook=HOOK + "2")
+
+    def boom(conn, sub, b, origin):
+        raise OverflowError("secret https://discord.com/api/webhooks/1/x")
+
+    monkeypatch.setitem(notify_mod.BUILDERS, "asset", boom)
+    h = Hook()
+    with caplog.at_level(logging.ERROR, logger="tracker.notify"):
+        s = h.run(conn_db)
+    assert (s["sent"], s["failed"]) == (1, 1)
+    rows = {r.subscription_id: r for r in delivery_rows(conn_db)}
+    assert rows[bad].status == "failed" and rows[bad].last_error == "internal error: OverflowError"
+    assert rows[good].status == "sent" and len(h.requests) == 1
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert str(bad) in logged and "OverflowError" in logged and "secret" not in logged
+
+
+def test_send_failure_of_one_subscription_is_isolated(conn_db):
+    first = subscribe(conn_db, "area", "vehicles", hook="https://discord.com/api/webhooks/1/aaa")
+    second = subscribe(conn_db, "area", "vehicles", hook="https://discord.com/api/webhooks/2/bbb")
+    h = Hook()
+
+    def handler(request):
+        if "/1/" in str(request.url):
+            raise ValueError("odd")
+        return httpx.Response(204)
+
+    h.use(handler)
+    s = h.run(conn_db)
+    rows = {r.subscription_id: r for r in delivery_rows(conn_db)}
+    assert (s["sent"], s["failed"]) == (1, 1)
+    assert rows[first].last_error == "internal error: ValueError" and rows[second].status == "sent"
+
+
+def test_game_text_is_not_rendered_as_markdown(conn_db):
+    evil_name = "[Click](http://evil) **@everyone** ||spoiler||"
+    evil_path = "Properties.`x`.# heading.[0]"
+    evil_value = "`; [Click](http://evil) **bold** ||spoiler||\n# heading https://evil.test/x"
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE asset SET name = :n WHERE path = 'Game/Weapons/DA_Rifle.json'"), {"n": evil_name})
+        conn.execute(text("UPDATE change SET field_path = :p, after = to_jsonb(CAST(:v AS text)) "
+                          "WHERE field_path = 'Properties.BaseDamage'"), {"p": evil_path, "v": evil_value})
+        conn.execute(text("UPDATE build_area SET title = :t WHERE area = 'vehicles'"), {"t": "[T](http://evil) **t**"})
+    subscribe(conn_db, "asset", asset_path="Game/Weapons/DA_Rifle.json")
+    subscribe(conn_db, "area", "vehicles", hook=HOOK + "2")
+    subscribe(conn_db, "field", "heading", hook=HOOK + "3")
+    h = Hook()
+    h.run(conn_db)
+    bodies = h.bodies()
+    assert len(bodies) == 3
+    for body in bodies:
+        assert body["allowed_mentions"] == {"parse": []}
+        e = body["embeds"][0]
+        for part in (e["title"], e["description"]):
+            rest = bare(part).replace("**", "")  # the only Markdown we add is the bold name prefix
+            assert not any(c in rest for c in "[]()_~|>#<`"), part
+            assert "://" not in rest and "\n#" not in part and "\n>" not in part, part
+    asset_embed = bodies[0]["embeds"][0]
+    assert asset_embed["title"] == "\\[Click\\]\\(http:\\/\\/evil\\) \\*\\*@everyone\\*\\* \\|\\|spoiler\\|\\| changed in b2"
+    # Backticks in the field path and value cannot close the code span that holds them.
+    assert "`Properties.ˋxˋ.# heading.[0]`" in asset_embed["description"]
+    assert "`\"ˋ; [Click](http://evil) **bold** ||spoiler||\\n# heading https://evil.test/x\"`" in asset_embed["description"]
+    assert bodies[1]["embeds"][0]["title"].startswith("\\[T\\]\\(http:\\/\\/evil\\) \\*\\*t\\*\\* changed")
+
+
+def test_markdown_helpers():
+    from tracker.notify import code, md
+    assert md("[Click](http://evil)") == "\\[Click\\]\\(http:\\/\\/evil\\)"
+    assert md("**@everyone** ||s|| # h") == "\\*\\*@everyone\\*\\* \\|\\|s\\|\\| \\# h"
+    assert md("- a") == "\\- a" and md("1. a") == "1\\. a" and md("a\nb") == "a b"
+    assert code("a`b") == "`aˋb`" and code("x" * 500, 10) == "`" + "x" * 9 + "…`" and code("") == "` `"
+
+
+def test_huge_asset_name_keeps_the_embed_within_discord_limits(conn_db):
+    name, path = "N" * 20_000, "Game/" + "p" * 5_000 + "/DA_Rifle.json"
+    with conn_db.begin() as conn:
+        conn.execute(text("UPDATE asset SET name = :n, path = :p WHERE name = 'DA_Rifle'"), {"n": name, "p": path})
+    subscribe(conn_db, "asset", asset_path=path)
+    h = Hook()
+    h.run(conn_db)
+    e = h.bodies()[0]["embeds"][0]
+    assert len(e["footer"]["text"]) == 2048 and len(e["url"]) <= 2048
+    assert e["url"] == ORIGIN + "/builds/b2"  # the asset link would be too long
+    assert len(e["title"]) + len(e["description"]) + len(e["footer"]["text"]) <= 6000
+    assert len(e["title"]) <= 256 and len(e["description"]) <= 4096
+
+
+def test_invalid_stored_webhook_is_not_called_and_is_disabled(conn_db):
+    bad = subscribe(conn_db, "area", "vehicles", hook="http://127.0.0.1:9/api/webhooks/1/x")
+    good = subscribe(conn_db, "area", "vehicles", hook=HOOK)
+    h = Hook()
+    s = h.run(conn_db)
+    assert [str(r.url) for r in h.requests] == [HOOK]
+    rows = {r.subscription_id: r for r in delivery_rows(conn_db)}
+    assert rows[bad].status == "failed" and rows[bad].last_error == "invalid webhook" and rows[bad].attempts == 0
+    assert disabled(conn_db, bad) is not None and disabled(conn_db, good) is None
+    assert (s["sent"], s["failed"], s["disabled"]) == (1, 1, 1)

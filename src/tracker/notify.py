@@ -2,7 +2,9 @@
 import json
 import logging
 import math
+import re
 import time
+import unicodedata
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from urllib.parse import quote
 
@@ -12,6 +14,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from tracker.api import NEWEST_FIRST, STATUS_ORDER, _contains
 from tracker.db import asset, asset_status, build, build_area, change, delivery, subscription
+from tracker.webhooks import WEBHOOK_RE
 
 log = logging.getLogger("tracker.notify")
 
@@ -20,6 +23,12 @@ MAX_TITLE = 256
 MAX_DESCRIPTION = 4096
 MAX_LINES = 10
 MAX_VALUE = 80
+MAX_PATH = 200
+MAX_NAME = 100
+MAX_FOOTER = 2048
+MAX_URL = 2048
+MAX_EMBED = 6000  # Discord counts title + description + footer text
+HUGE = 1e300  # numbers at or beyond this are shown as plain values, not subtracted
 MAX_LINE = 400  # keeps ten lines plus the "and N more" line near the description limit
 MAX_ERROR = 300
 ATTEMPTS = 3
@@ -83,38 +92,79 @@ def _cut(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# ---------- Discord Markdown safety ----------
+# Game text is hostile input. Fragments go into the message either escaped (md) or inside a code span that
+# cannot be closed (code); both are one line, and both are cut to length BEFORE they are wrapped.
+
+_SPECIAL = re.compile(r"([\\*_~|>\[\]()#<`])")
+_LIST_START = re.compile(r"^(\s*)(?:([-+])|(\d+)\.)")
+
+
+def _oneline(text: str) -> str:
+    return "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in text)
+
+
+def md(text: str, limit: int = 10_000) -> str:
+    """Plain text that Discord will not render as Markdown: no emphasis, links, headings, spoilers or mentions
+    syntax, and no clickable bare URL."""
+    text = _SPECIAL.sub(r"\\\1", _cut(_oneline(text), limit))
+    text = _LIST_START.sub(lambda m: m[1] + (f"\\{m[2]}" if m[2] else f"{m[3]}\\."), text)
+    return text.replace("://", ":\\/\\/")
+
+
+def code(text: str, limit: int = MAX_VALUE) -> str:
+    """A code span: Markdown inside it is inert, and backticks are swapped out so it cannot be closed early."""
+    return "`" + (_cut(_oneline(text), limit).replace("`", "ˋ") or " ") + "`"
+
+
 def _value(v) -> str:
-    return _cut(json.dumps(v, separators=(",", ":"), ensure_ascii=False), MAX_VALUE)
+    try:
+        text = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, OverflowError):  # e.g. an integer too long to print
+        text = "<unprintable>"
+    return code(text)
+
+
+def _plain_number(v) -> bool:
+    return _is_number(v) and (isinstance(v, int) or math.isfinite(v)) and abs(v) < HUGE
 
 
 def change_line(c) -> str:
-    if _is_number(c.before) and _is_number(c.after) and math.isfinite(c.before) and math.isfinite(c.after):
-        b, a = _number_pair(c.before, c.after)
-        values = f"{b} ▶ {a}  {_delta(c.before, c.after)}"
-    else:
+    values = None
+    if _plain_number(c.before) and _plain_number(c.after):
+        try:
+            b, a = _number_pair(c.before, c.after)
+            values = f"{b} ▶ {a}  {_delta(c.before, c.after)}"
+        except (ArithmeticError, ValueError):  # e.g. a difference too large for a float
+            pass
+    if values is None:
         values = f"{_value(c.before)} ▶ {_value(c.after)}"
-    return _cut(f"`{c.field_path}`  {values}", MAX_LINE)
+    return f"{code(c.field_path, MAX_PATH)}  {values}"
 
 
-def description(lines: list[str], total: int, link: str) -> str:
+def description(lines: list[str], total: int, link: str, limit: int = MAX_DESCRIPTION) -> str:
     """At most 10 lines, then "and N more" with the link; lines are dropped until it fits Discord's limit."""
     shown = lines[:MAX_LINES]
     while True:
         more = total - len(shown)
         text = "\n".join(shown + ([f"and {more} more: {link}"] if more > 0 else []))
-        if len(text) <= MAX_DESCRIPTION or not shown:
-            return _cut(text, MAX_DESCRIPTION)
+        if len(text) <= limit or not shown:
+            return _cut(text, limit)
         shown.pop()
 
 
-def _embed(title: str, url: str, lines: list[str], total: int, footer: str) -> dict:
+def _embed(title: str, url: str, lines: list[str], total: int, footer: str, fallback: str) -> dict:
+    title, footer = _cut(title, MAX_TITLE), _cut(_oneline(footer), MAX_FOOTER)
+    if len(url) > MAX_URL:  # a very long asset path: link to the build page instead
+        url = fallback
+    budget = min(MAX_DESCRIPTION, MAX_EMBED - len(title) - len(footer))
     return {
         "username": "Wardogs Patch Tracker",
         "allowed_mentions": {"parse": []},
         "embeds": [{
-            "title": _cut(title, MAX_TITLE),
+            "title": title,
             "url": url,
-            "description": description(lines, total, url),
+            "description": description(lines, total, url, budget),
             "footer": {"text": footer},
         }],
     }
@@ -124,6 +174,10 @@ def _embed(title: str, url: str, lines: list[str], total: int, footer: str) -> d
 
 def _q(text: str) -> str:
     return quote(text, safe="")
+
+
+def _build_url(origin: str, b) -> str:
+    return f"{origin}/builds/{_q(b.label)}"
 
 
 def _asset_message(conn, sub, b, origin):
@@ -140,7 +194,8 @@ def _asset_message(conn, sub, b, origin):
     verb = "changed" if row.status == "modified" else row.status
     lines = [f"Status: {row.status}"] + [change_line(c) for c in rows]
     url = f"{origin}/asset?path={_q(row.path)}"
-    return _embed(f"{row.name} {verb} in {b.label}", url, lines, total + 1, f"Watching: asset {row.name}")
+    return _embed(f"{md(row.name, MAX_NAME)} {verb} in {md(b.label, MAX_NAME)}", url, lines, total + 1,
+                  f"Watching: asset {row.name}", _build_url(origin, b))
 
 
 def _area_message(conn, sub, b, origin):
@@ -159,9 +214,10 @@ def _area_message(conn, sub, b, origin):
     title = area.title if area else sub.target
     counts = ", ".join(f"{area.counts[k]} {k}" for k in ("added", "removed", "modified", "moved")
                        if area.counts.get(k)) if area else ""
-    lines = ([counts] if counts else []) + [f"{r.status}  {r.name}" for r in rows]
+    lines = ([counts] if counts else []) + [f"{r.status}  {md(r.name, MAX_NAME)}" for r in rows]
     url = f"{origin}/builds/{_q(b.label)}?area={_q(sub.target)}"
-    return _embed(f"{title} changed in {b.label}", url, lines, total + bool(counts), f"Watching: area {sub.target}")
+    return _embed(f"{md(title, MAX_NAME)} changed in {md(b.label, MAX_NAME)}", url, lines, total + bool(counts),
+                  f"Watching: area {sub.target}", _build_url(origin, b))
 
 
 def _field_message(conn, sub, b, origin):
@@ -176,10 +232,10 @@ def _field_message(conn, sub, b, origin):
         .order_by(*NEWEST_FIRST, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C"), change.c.id)
         .limit(MAX_LINES)
     ).all()
-    lines = [_cut(f"**{r.name}**  {change_line(r)}", MAX_LINE) for r in rows]
+    lines = [f"**{md(r.name, MAX_NAME)}**  {change_line(r)}" for r in rows]
     url = f"{origin}/changes?field={_q(sub.target)}&build={_q(b.label)}"
-    title = f"{total} change{'' if total == 1 else 's'} matching “{sub.target}” in {b.label}"
-    return _embed(title, url, lines, total, f"Watching: field {sub.target}")
+    title = f"{total} change{'' if total == 1 else 's'} matching “{md(sub.target, MAX_NAME)}” in {md(b.label, MAX_NAME)}"
+    return _embed(title, url, lines, total, f"Watching: field {sub.target}", _build_url(origin, b))
 
 
 BUILDERS = {"asset": _asset_message, "area": _area_message, "field": _field_message}
@@ -251,9 +307,15 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
             delivery.c.subscription_id == subscription.c.id, delivery.c.build_id == b.id, delivery.c.status == "sent")
         subs = conn.execute(select(subscription).where(subscription.c.disabled_at.is_(None), ~sent.exists())
                             .order_by(subscription.c.id)).all()
-        due = []
+        due, broken = [], []
         for sub in subs:
-            body = BUILDERS[sub.kind](conn, sub, b, origin)
+            try:
+                with conn.begin_nested():  # a failed statement must not poison the other subscriptions
+                    body = BUILDERS[sub.kind](conn, sub, b, origin)
+            except Exception as e:
+                log.error("subscription %s: building the message failed: %s", sub.id, type(e).__name__)
+                broken.append((sub, f"internal error: {type(e).__name__}"))
+                continue
             if body is not None:
                 due.append((sub, body))
 
@@ -262,17 +324,36 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
         summary["messages"] = [{"subscription_id": s.id, "body": body} for s, body in due]
         return summary
 
+    for sub, error in broken:
+        _finish(engine, summary, sub.id, b.id, "failed", 0, error, False)
+
     own_client = client is None
     client = client or httpx.Client()
     try:
         for sub, body in due:
-            status, tries, error, gone = send(client, sub.webhook_url, body, sleep)
-            _record(engine, sub.id, b.id, status, tries, error, gone)
-            summary[status] += 1
-            summary["disabled"] += gone
-            log.info("subscription %s: %s after %s attempt(s)%s", sub.id, status, tries,
-                     " (webhook gone, disabled)" if gone else "")
+            try:
+                if not WEBHOOK_RE.fullmatch(sub.webhook_url):  # the stored value is re-checked before it is used
+                    status, tries, error, gone = "failed", 0, "invalid webhook", True
+                else:
+                    status, tries, error, gone = send(client, sub.webhook_url, body, sleep)
+            except Exception as e:
+                log.error("subscription %s: sending failed: %s", sub.id, type(e).__name__)
+                status, tries, error, gone = "failed", 0, f"internal error: {type(e).__name__}", False
+            _finish(engine, summary, sub.id, b.id, status, tries, error, gone)
     finally:
         if own_client:
             client.close()
     return summary
+
+
+def _finish(engine, summary: dict, sub_id: int, build_id: int, status: str, tries: int, error: str | None,
+            gone: bool) -> None:
+    try:
+        _record(engine, sub_id, build_id, status, tries, error, gone)
+    except Exception as e:
+        log.error("subscription %s: recording the delivery failed: %s", sub_id, type(e).__name__)
+        status, gone = "failed", False
+    summary[status] += 1
+    summary["disabled"] += gone
+    log.info("subscription %s: %s after %s attempt(s)%s", sub_id, status, tries,
+             " (webhook gone, disabled)" if gone else "")
