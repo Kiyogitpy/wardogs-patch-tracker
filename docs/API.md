@@ -143,7 +143,7 @@ One asset and its whole history. 404 `{"detail": "asset not found"}`.
 
 | Query | Meaning |
 |---|---|
-| `path` | required. The current path, or a former path: then the asset it moved to is returned, and `path` in the response is the current one |
+| `path` | required, at most 1,000 characters, no NUL. The current path, or a former path: then the asset it moved to is returned, and `path` in the response is the current one. A current path wins over a former path. An asset in no ingested diff is 404 |
 | `field` | optional; case-insensitive substring of `field_path`. Narrows every `changes` list; builds stay listed even when their list becomes empty |
 
 ```json
