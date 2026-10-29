@@ -1,5 +1,7 @@
 """Body cap, rate limiting and statement timeout in front of the API."""
+import psycopg.errors
 import pytest
+import sqlalchemy.exc
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -110,3 +112,47 @@ def test_slow_query_is_503_not_500(client, monkeypatch):
     finally:
         api.app.router.routes[:] = [x for x in api.app.router.routes if getattr(x, "path", "") != "/api/_slow"]
     assert r.status_code == 503 and r.json() == {"detail": "query took too long, narrow the search"}
+
+
+# --- database errors under load ---------------------------------------------------------------------------------
+
+BUSY = {"detail": "the database is busy, try again shortly"}
+SLOW = {"detail": "query took too long, narrow the search"}
+
+
+class BrokenEngine:
+    def __init__(self, error):
+        self.error = error
+
+    def connect(self):
+        raise self.error
+
+
+@pytest.mark.parametrize("orig, body", [
+    (psycopg.errors.DiskFull("could not resize shared memory segment"), BUSY),
+    (psycopg.errors.TooManyConnections("sorry, too many clients already"), BUSY),
+    (psycopg.OperationalError("server closed the connection unexpectedly"), BUSY),
+    (psycopg.errors.QueryCanceled("canceling statement due to statement timeout"), SLOW),
+])
+def test_database_operational_errors_are_503(orig, body, monkeypatch):
+    error = sqlalchemy.exc.OperationalError("SELECT 1", {}, orig)
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    r = TestClient(api.app, raise_server_exceptions=False).get("/api/builds")
+    assert r.status_code == 503 and r.json() == body
+
+
+def test_pool_timeout_is_503(monkeypatch):
+    error = sqlalchemy.exc.TimeoutError("QueuePool limit of size 5 overflow 10 reached")
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    r = TestClient(api.app, raise_server_exceptions=False).get("/api/builds")
+    assert r.status_code == 503 and r.json() == BUSY
+
+
+def test_other_database_errors_stay_500(monkeypatch):
+    error = sqlalchemy.exc.ProgrammingError("SELECT 1", {}, psycopg.errors.UndefinedTable("no such table"))
+    monkeypatch.setattr(api, "get_engine", lambda: BrokenEngine(error))
+    assert TestClient(api.app, raise_server_exceptions=False).get("/api/builds").status_code == 500
+
+
+def test_pool_waits_at_most_5_seconds(client):
+    assert api.get_engine().pool.timeout() == 5

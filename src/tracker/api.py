@@ -9,9 +9,10 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from psycopg import OperationalError
 from psycopg.errors import QueryCanceled
 from sqlalchemy import Engine, case, create_engine, exists, func, select
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, TimeoutError as PoolTimeout
 
 from tracker.db import asset, asset_alias, asset_status, build, build_area, change
 
@@ -27,9 +28,12 @@ NEWEST_FIRST = (build.c.released_at.desc().nulls_last(), build.c.id.desc())
 # Asset status order within a build, as season_diff.py lists them.
 STATUS_ORDER = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value=asset_status.c.status)
 
-app = FastAPI(title="Wardogs patch tracker")
+# redirect_slashes off: Starlette would build the redirect target from the Host header.
+app = FastAPI(title="Wardogs patch tracker", redirect_slashes=False)
 
 MAX_BODY = 64 * 1024  # bytes of request body accepted under /api
+BUSY = {"detail": "the database is busy, try again shortly"}
+POOL_TIMEOUT = 5  # seconds a request waits for a pooled connection
 STATEMENT_TIMEOUT_MS = 3000  # per statement, API engine only (ingest and notify use their own engines)
 # Token buckets per client IP: (requests per minute, burst). Tests patch these.
 RATE_AUTH = (10, 5)
@@ -125,15 +129,23 @@ app.add_middleware(Guard)  # added after check_origin, so it wraps it
 
 
 @app.exception_handler(DBAPIError)
-async def slow_query(request: Request, exc: DBAPIError):
-    if not isinstance(exc.orig, QueryCanceled):
-        raise exc
-    return JSONResponse({"detail": "query took too long, narrow the search"}, status_code=503)
+async def database_error(request: Request, exc: DBAPIError):
+    """Timeouts, a full disk or shared memory, too many connections, a lost connection: busy, not a crash."""
+    if isinstance(exc.orig, QueryCanceled):
+        return JSONResponse({"detail": "query took too long, narrow the search"}, status_code=503)
+    if isinstance(exc.orig, OperationalError):
+        return JSONResponse(BUSY, status_code=503)
+    raise exc
+
+
+@app.exception_handler(PoolTimeout)
+async def pool_exhausted(request: Request, exc: PoolTimeout):
+    return JSONResponse(BUSY, status_code=503)
 
 
 @cache
 def get_engine() -> Engine:
-    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True,
+    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, pool_timeout=POOL_TIMEOUT,
                          connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"})
 
 
