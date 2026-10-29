@@ -462,3 +462,17 @@ def test_callback_exchange_cap_redirects_at_once(client, discord, world, monkeyp
     r = client.get("/api/auth/callback", params={"code": "c", "state": state})
     assert r.headers["location"] == "/" and count(world, "session") == 1
     assert accounts._exchanges == 0
+
+
+def test_webhook_ids_with_leading_zeros_are_the_same_webhook():
+    from tracker.webhooks import canonical
+    plain = canonical("https://discord.com/api/webhooks/123/tok")
+    assert plain == "https://discord.com/api/webhooks/123/tok"
+    assert canonical("https://discord.com/api/webhooks/0123/tok") == plain
+    assert canonical("https://ptb.discord.com/api/webhooks/000123/tok") == plain
+    assert canonical("https://discord.com/api/webhooks/000/tok") == "https://discord.com/api/webhooks/0/tok"
+
+
+def test_leading_zero_duplicate_is_409(user):
+    assert post(user).status_code == 201
+    assert post(user, webhook_url="https://discord.com/api/webhooks/01234567890/abcdefghijk3Zq").status_code == 409
