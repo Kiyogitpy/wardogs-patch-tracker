@@ -19,6 +19,8 @@ Offset = Annotated[int, Query(ge=0, le=1_000_000)]
 
 # Build order, defined once: newest first. Chronological is this order reversed (done in Python).
 NEWEST_FIRST = (build.c.released_at.desc().nulls_last(), build.c.id.desc())
+# Asset status order within a build, as season_diff.py lists them.
+STATUS_ORDER = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value=asset_status.c.status)
 
 app = FastAPI(title="Wardogs patch tracker")
 
@@ -137,7 +139,6 @@ def list_assets(
         joined = asset_status.join(asset, asset.c.id == asset_status.c.asset_id)
         total = conn.execute(select(func.count()).select_from(joined).where(*where)).scalar_one()
 
-        status_order = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value=asset_status.c.status)
         rows = conn.execute(
             select(asset.c.id, asset.c.path, asset.c.name, asset.c.type, asset_status.c.area, asset_status.c.status,
                    asset_alias.c.old_path, asset_status.c.paired_by, asset_status.c.exports, asset_status.c.note,
@@ -145,7 +146,7 @@ def list_assets(
             .select_from(joined.outerjoin(asset_alias, (asset_alias.c.build_id == asset_status.c.build_id)
                                           & (asset_alias.c.asset_id == asset_status.c.asset_id)))
             # "C" collation: code-point order, independent of the server locale (which ignores punctuation).
-            .where(*where).order_by(status_order, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C"))
+            .where(*where).order_by(STATUS_ORDER, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C"))
             .limit(limit).offset(offset)
         ).all()
 

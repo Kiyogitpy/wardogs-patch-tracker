@@ -7,10 +7,10 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import case, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from tracker.api import NEWEST_FIRST, _contains
+from tracker.api import NEWEST_FIRST, STATUS_ORDER, _contains
 from tracker.db import asset, asset_status, build, build_area, change, delivery, subscription
 
 log = logging.getLogger("tracker.notify")
@@ -150,10 +150,9 @@ def _area_message(conn, sub, b, origin):
     if total == 0:
         return None
     # Same order as /api/builds/{label}/assets.
-    status_order = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value=asset_status.c.status)
     rows = conn.execute(
         select(asset.c.name, asset_status.c.status).select_from(joined).where(*where)
-        .order_by(status_order, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C")).limit(MAX_LINES)
+        .order_by(STATUS_ORDER, func.lower(asset.c.name).collate("C"), asset.c.path.collate("C")).limit(MAX_LINES)
     ).all()
     area = conn.execute(select(build_area.c.title, build_area.c.counts)
                         .where(build_area.c.build_id == b.id, build_area.c.area == sub.target)).first()
