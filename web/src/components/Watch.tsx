@@ -45,7 +45,7 @@ export default function Watch({ target, what }: { target: Target; what: string }
     btn.current?.focus()
   }
   const openForm = () => {
-    setUrl(loadWebhook())
+    setUrl(loadWebhook(me.me.discord_id))
     setMsg(null)
     setOpen(true)
     // The input mounts on the next render.
@@ -67,7 +67,7 @@ export default function Watch({ target, what }: { target: Target; what: string }
     setMsg(null)
     try {
       await createSubscription({ ...target, webhook_url } as NewSubscription)
-      saveWebhook(webhook_url)
+      saveWebhook(me.me.discord_id, webhook_url)
       setMsg({ ok: true, text: `Watching ${what}. Discord will get a message when a new patch changes it.` })
       setOpen(false)
     } catch (err) {

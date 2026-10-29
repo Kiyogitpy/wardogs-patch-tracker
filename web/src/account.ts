@@ -21,19 +21,39 @@ export function webhookParts(masked: string): { id: string; tail: string } | nul
 
 const KEY = 'watch-webhook'
 
-// sessionStorage only: the URL is a secret, so it never goes to localStorage.
-export function loadWebhook(): string {
+// sessionStorage only: the URL is a secret, so it never goes to localStorage. It is stored with the id of
+// the user who entered it and is read back only for that user.
+export function loadWebhook(userId: string): string {
   try {
-    return sessionStorage.getItem(KEY) ?? ''
+    const stored = JSON.parse(sessionStorage.getItem(KEY) ?? 'null')
+    return stored?.user === userId && typeof stored.url === 'string' ? stored.url : ''
   } catch {
     return ''
   }
 }
 
-export function saveWebhook(url: string) {
+export function saveWebhook(userId: string, url: string) {
   try {
-    sessionStorage.setItem(KEY, url)
+    sessionStorage.setItem(KEY, JSON.stringify({ user: userId, url }))
   } catch {
     /* storage blocked */
+  }
+}
+
+export function clearWebhook() {
+  try {
+    sessionStorage.removeItem(KEY)
+  } catch {
+    /* storage blocked */
+  }
+}
+
+/** Forget the remembered URL unless it belongs to `userId` (null: nobody is signed in). */
+export function forgetWebhookUnlessOwnedBy(userId: string | null) {
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(KEY) ?? 'null')
+    if (stored !== null && (userId === null || stored?.user !== userId)) clearWebhook()
+  } catch {
+    clearWebhook()
   }
 }

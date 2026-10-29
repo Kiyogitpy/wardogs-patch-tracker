@@ -1,6 +1,15 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getMe, createSubscription, ApiError } from './api'
-import { isWebhookUrl, loginHref, safeNext, webhookParts } from './account'
+import {
+  clearWebhook,
+  forgetWebhookUnlessOwnedBy,
+  isWebhookUrl,
+  loadWebhook,
+  loginHref,
+  safeNext,
+  saveWebhook,
+  webhookParts,
+} from './account'
 
 describe('webhook regex', () => {
   it.each(['discord.com', 'discordapp.com', 'ptb.discord.com', 'canary.discord.com'])('accepts %s', (h) => {
@@ -70,5 +79,46 @@ describe('api client', () => {
   it('joins a 422 validation list into one message', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => reply(422, { detail: [{ msg: 'a' }, { msg: 'b' }] })))
     await expect(createSubscription({ kind: 'area', target: 'x', webhook_url: 'u' })).rejects.toMatchObject({ message: 'a; b' })
+  })
+})
+
+describe('remembered webhook', () => {
+  const URL1 = 'https://discord.com/api/webhooks/1/aaa'
+  const store = new Map<string, string>()
+  beforeEach(() => {
+    store.clear()
+    vi.stubGlobal('sessionStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    })
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('is returned to the user who saved it only', () => {
+    saveWebhook('111', URL1)
+    expect(loadWebhook('111')).toBe(URL1)
+    expect(loadWebhook('222')).toBe('')
+  })
+  it('is cleared on sign-out', () => {
+    saveWebhook('111', URL1)
+    clearWebhook()
+    expect(store.size).toBe(0)
+  })
+  it('is cleared when /api/me returns another user or none, kept for the same user', () => {
+    saveWebhook('111', URL1)
+    forgetWebhookUnlessOwnedBy('111')
+    expect(loadWebhook('111')).toBe(URL1)
+    forgetWebhookUnlessOwnedBy('222')
+    expect(store.size).toBe(0)
+    saveWebhook('111', URL1)
+    forgetWebhookUnlessOwnedBy(null)
+    expect(store.size).toBe(0)
+  })
+  it('drops an old untagged value', () => {
+    store.set('watch-webhook', URL1)
+    expect(loadWebhook('111')).toBe('')
+    forgetWebhookUnlessOwnedBy('111')
+    expect(store.size).toBe(0)
   })
 })
