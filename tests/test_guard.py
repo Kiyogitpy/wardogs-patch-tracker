@@ -156,3 +156,39 @@ def test_other_database_errors_stay_500(monkeypatch):
 
 def test_pool_waits_at_most_5_seconds(client):
     assert api.get_engine().pool.timeout() == 5
+
+
+# --- rate limit buckets -----------------------------------------------------------------------------------------
+
+def _statuses(monkeypatch, *ips):
+    import asyncio
+    monkeypatch.setattr(api, "RATE_API", (60, 2))  # burst 2, a token a second
+
+    async def inner(scope, receive, send):
+        await api._reply(send, 200, "ok")
+
+    async def run():
+        out = []
+        for ip in ips:
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            await api.Guard(inner)({"type": "http", "path": "/api/builds", "headers": [], "client": (ip, 1)}, None, send)
+            out.append(sent[0]["status"])
+        return out
+
+    return asyncio.run(run())
+
+
+def test_ipv6_addresses_in_one_slash_64_share_a_bucket(monkeypatch):
+    got = _statuses(monkeypatch, "2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2:1:2:3:4",
+                    "2001:db8:1:3::1")
+    assert got == [200, 200, 429, 200]  # the third is in the first one's /64; the fourth is in another
+    assert ("2001:db8:1:2::/64", "api") in api._buckets
+
+
+def test_ipv4_is_limited_per_address_and_mapped_ipv6_is_ipv4(monkeypatch):
+    got = _statuses(monkeypatch, "192.0.2.1", "192.0.2.2", "192.0.2.1", "::ffff:192.0.2.1", "192.0.2.2")
+    assert got == [200, 200, 200, 429, 200]

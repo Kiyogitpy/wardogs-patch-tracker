@@ -1,4 +1,5 @@
 """Read-only JSON API over the ingested builds. See docs/API.md."""
+import ipaddress
 import json
 import math
 import os
@@ -57,6 +58,20 @@ def _take(ip: str, group: str, per_minute: int, burst: int) -> float:
     return 0.0 if allowed else (1 - tokens) * 60 / per_minute
 
 
+def client_key(host: str) -> str:
+    """The rate-limit identity of a client: an IPv4 address as is, an IPv6 address as its /64 (one subscriber
+    gets a whole /64, so per-address limits would cost an attacker nothing). Anything else is used as given."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network((ip, 64), strict=False))
+    return str(ip)
+
+
 async def _reply(send, status: int, detail: str, headers: list[tuple[bytes, bytes]] = ()) -> None:
     body = json.dumps({"detail": detail}).encode()
     await send({"type": "http.response.start", "status": status, "headers": [
@@ -75,7 +90,7 @@ class Guard:
         path = scope.get("path", "")
         if scope["type"] != "http" or not (path == "/api" or path.startswith("/api/")):
             return await self.app(scope, receive, send)
-        ip = (scope.get("client") or ("unknown",))[0]
+        ip = client_key((scope.get("client") or ("unknown",))[0])
         per_minute, burst = RATE_AUTH if path.startswith("/api/auth/") else RATE_API
         wait = _take(ip, "auth" if path.startswith("/api/auth/") else "api", per_minute, burst)
         if wait:
