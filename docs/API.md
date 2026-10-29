@@ -273,7 +273,9 @@ The signed-in user's subscriptions, newest first. 401 when signed out.
 ]
 ```
 
-`webhook` is masked: the webhook id, then `…` and the last 4 characters of the token. `asset` is null unless
+`webhook` is masked: the webhook id, then `…` and the last 4 characters of the token. `last_delivery.status` is `sent` or
+`failed`. `disabled_at` is set by `tracker notify` when Discord answers 401, 403 or 404 for the webhook (see
+`docs/NOTIFY.md`). `asset` is null unless
 `kind` is `asset`. `last_delivery` is the newest delivery row, or null.
 
 ### `POST /api/subscriptions`
