@@ -7,9 +7,10 @@ from datetime import date
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import DBAPIError
 
 from tracker.ingest import TotalsMismatch, ingest
-from tracker.notify import UnknownBuild, make_engine, notify
+from tracker.notify import RUN_DEADLINE, UnknownBuild, make_engine, notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--released", type=date.fromisoformat, help="release date, YYYY-MM-DD")
     n = sub.add_parser("notify", help="post Discord webhook messages for the subscriptions a build matches")
     n.add_argument("--label", required=True, help="label of an ingested build")
+    n.add_argument("--deadline-seconds", type=float, default=RUN_DEADLINE,
+                   help="stop sending after this many seconds; unsent subscriptions are left for a re-run (default %(default)s)")
     n.add_argument("--dry-run", action="store_true", help="print the messages, send and write nothing")
     args = parser.parse_args(argv)
 
@@ -46,10 +49,19 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:  # a bad diff (also bad JSON): nothing was written
         print(f"tracker: bad diff, nothing was written: {e}", file=sys.stderr)
         return 1
+    except (DBAPIError, TypeError) as e:  # the database refused the data: nothing was written
+        print(f"tracker: database error, nothing was written: {type(e).__name__}: {_one_line(e)}", file=sys.stderr)
+        return 3
     finally:
         engine.dispose()
     print(f"ingested {args.label}: {result['assets']} assets, {result['changes']} changes; totals match index.json")
     return 0
+
+
+def _one_line(e: Exception) -> str:
+    """The driver's message (not the SQL or its parameters), on one line."""
+    message = str(getattr(e, "orig", None) or e)
+    return " ".join(message.split())[:300]
 
 
 def _notify(parser, url: str, args) -> int:
@@ -60,7 +72,7 @@ def _notify(parser, url: str, args) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every request URL, which is the webhook secret
     engine = make_engine(url)
     try:
-        result = notify(engine, args.label, origin, dry_run=args.dry_run)
+        result = notify(engine, args.label, origin, dry_run=args.dry_run, deadline_seconds=args.deadline_seconds)
     except UnknownBuild:
         print(f"tracker: build {args.label!r} is not ingested", file=sys.stderr)
         return 2
@@ -73,4 +85,7 @@ def _notify(parser, url: str, args) -> int:
         return 0
     print(f"notified {args.label}: {result['sent']} sent, {result['failed']} failed, "
           f"{result['disabled']} subscription(s) disabled")
-    return 1 if result["failed"] else 0
+    if result["skipped"]:
+        print(f"tracker: run deadline reached, {result['skipped']} subscription(s) were not sent; run notify again "
+              f"to send them", file=sys.stderr)
+    return 1 if result["failed"] or result["skipped"] else 0

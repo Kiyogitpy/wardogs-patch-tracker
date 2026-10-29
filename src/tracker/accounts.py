@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -22,7 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from tracker.db import app_user, asset, build, build_area, delivery, oauth_state, session, subscription
-from tracker.webhooks import canonical
+from tracker.webhooks import StrictJsonRoute, Text, canonical
 
 
 def _api():
@@ -31,7 +32,7 @@ def _api():
     return api
 
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", route_class=StrictJsonRoute)
 
 DISCORD_AUTHORIZE = "https://discord.com/oauth2/authorize"
 DISCORD_TOKEN = "https://discord.com/api/oauth2/token"
@@ -39,7 +40,8 @@ DISCORD_ME = "https://discord.com/api/users/@me"
 SESSION_TTL = timedelta(days=30)
 STATE_TTL = 600
 MAX_SESSIONS = 10  # per user; a login beyond it ends the user's oldest
-EXCHANGE_DEADLINE = 8.0  # seconds for the whole Discord exchange (token call and profile call together)
+EXCHANGE_DEADLINE = 8.0  # wall-clock seconds for the whole Discord exchange (token call and profile call together)
+MAX_RESPONSE = 64 * 1024  # bytes of one Discord response body
 MAX_SUBSCRIPTIONS = 25
 MAX_NEXT = 500
 MAX_EXCHANGES = 4  # concurrent Discord code exchanges; tests patch it
@@ -102,7 +104,7 @@ def _failed() -> RedirectResponse:
 
 
 @router.get("/auth/login")
-def login(next: str | None = None):
+def login(next: Text | None = None):
     client_id = os.environ.get("DISCORD_CLIENT_ID")
     if not client_id or not os.environ.get("DISCORD_CLIENT_SECRET") or not _public_origin():
         raise HTTPException(503, "sign-in is not configured")
@@ -138,9 +140,9 @@ class _DeadlinePassed(Exception):
     pass
 
 
-def _discord_user(code: str) -> dict | None:
-    """Exchange the code and read the profile; None on any Discord failure. Neither secret is logged.
-    Both calls share one wall-clock deadline: each gets what is left of EXCHANGE_DEADLINE as its timeout."""
+def _fetch_profile(code: str):
+    """The two Discord calls, run on a worker thread. Each response is read in chunks, the deadline is checked per
+    chunk, and a body over MAX_RESPONSE is refused. Returns the profile JSON, or None on any failure."""
     deadline = _monotonic() + EXCHANGE_DEADLINE
 
     def left() -> float:
@@ -149,20 +151,49 @@ def _discord_user(code: str) -> dict | None:
             raise _DeadlinePassed
         return remaining
 
+    def read(client: httpx.Client, method: str, url: str, **kwargs):
+        with client.stream(method, url, timeout=left(), **kwargs) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                left()
+                body += chunk
+                if len(body) > MAX_RESPONSE:
+                    raise ValueError("Discord response too large")
+        left()  # a response that arrived after the deadline is not used
+        return json.loads(bytes(body))
+
     try:
         with http_client() as client:
-            token = client.post(DISCORD_TOKEN, timeout=left(), data={
+            access = read(client, "POST", DISCORD_TOKEN, data={
                 "client_id": os.environ["DISCORD_CLIENT_ID"], "client_secret": os.environ["DISCORD_CLIENT_SECRET"],
                 "grant_type": "authorization_code", "code": code,
-                "redirect_uri": _public_origin() + "/api/auth/callback"})
-            token.raise_for_status()
-            access = token.json()["access_token"]
-            me = client.get(DISCORD_ME, headers={"Authorization": f"Bearer {access}"}, timeout=left())
-            me.raise_for_status()
-            profile = me.json()
-            left()  # a profile that arrived after the deadline is not used
+                "redirect_uri": _public_origin() + "/api/auth/callback"})["access_token"]
+            return read(client, "GET", DISCORD_ME, headers={"Authorization": f"Bearer {access}"})
     except (httpx.HTTPError, ValueError, KeyError, TypeError, _DeadlinePassed):
         return None
+
+
+def _discord_user(code: str) -> dict | None:
+    """Exchange the code and read the profile; None on any Discord failure. Neither secret is logged.
+    The exchange runs on a worker thread and is abandoned at EXCHANGE_DEADLINE of wall-clock time, however the
+    server drips its answer. The worker only returns data; the session is written by the caller, so an abandoned
+    worker cannot create one (it ends at its next chunk or socket timeout)."""
+    box: list = []
+    done = threading.Event()
+
+    def work():
+        try:
+            box.append(_fetch_profile(code))
+        except Exception:
+            box.append(None)
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="discord-exchange", daemon=True).start()
+    if not done.wait(EXCHANGE_DEADLINE) or box[0] is None:
+        return None
+    profile = box[0]
     if (not isinstance(profile, dict) or not isinstance(profile.get("id"), str)
             or not re.fullmatch(r"\d{1,20}", profile["id"], re.ASCII)
             or not isinstance(profile.get("username"), str) or not profile["username"]
@@ -192,7 +223,7 @@ def _exchange(code: str) -> dict | None:
 
 
 @router.get("/auth/callback")
-def callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+def callback(request: Request, code: Text | None = None, state: Text | None = None, error: Text | None = None):
     next_path = _parse_state_cookie(request.cookies.get(cookie_name("oauth_state")), state)
     if error or next_path is None or not code or len(code) > 512 or not _public_origin():
         return _failed()
@@ -313,9 +344,9 @@ def list_subscriptions(user: User, response: Response):
 class SubscriptionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["asset", "area", "field"]
-    asset_path: str | None = None
-    target: str | None = None
-    webhook_url: str
+    asset_path: Text | None = None
+    target: Text | None = None
+    webhook_url: Text
 
 
 @router.post("/subscriptions", status_code=201)

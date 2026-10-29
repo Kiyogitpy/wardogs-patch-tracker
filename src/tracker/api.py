@@ -1,6 +1,7 @@
 """Read-only JSON API over the ingested builds. See docs/API.md."""
 import ipaddress
 import json
+import logging
 import math
 import os
 import time
@@ -9,6 +10,7 @@ from functools import cache
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 from psycopg.errors import QueryCanceled
@@ -16,11 +18,13 @@ from sqlalchemy import Engine, case, create_engine, exists, func, select
 from sqlalchemy.exc import DBAPIError, TimeoutError as PoolTimeout
 
 from tracker.db import asset, asset_alias, asset_status, build, build_area, change
+from tracker.webhooks import StrictJsonRoute, Text, Utf8
 
 COUNT_KEYS = ("added", "removed", "modified", "moved", "property_changes", "removed_values")
 
 # A text filter. NUL is rejected here because Postgres text cannot hold it (the driver would raise a 500).
-Filter = Annotated[str | None, Query(max_length=200, pattern=r"^[^\x00]*$")]
+# Text that does not encode as UTF-8 (a lone surrogate) is rejected too.
+Filter = Annotated[str | None, Query(max_length=200, pattern=r"^[^\x00]*$"), Utf8]
 Limit = Annotated[int, Query(ge=1, le=200)]
 Offset = Annotated[int, Query(ge=0, le=1_000_000)]
 
@@ -31,7 +35,9 @@ STATUS_ORDER = case({"modified": 0, "moved": 1, "added": 2, "removed": 3}, value
 
 # redirect_slashes off: Starlette would build the redirect target from the Host header.
 app = FastAPI(title="Wardogs patch tracker", redirect_slashes=False)
+app.router.route_class = StrictJsonRoute  # routes added from here on reject NaN and Infinity in JSON bodies
 
+log = logging.getLogger("tracker.api")
 MAX_BODY = 64 * 1024  # bytes of request body accepted under /api
 BUSY = {"detail": "the database is busy, try again shortly"}
 POOL_TIMEOUT = 5  # seconds a request waits for a pooled connection
@@ -91,8 +97,10 @@ class Guard:
         if scope["type"] != "http" or not (path == "/api" or path.startswith("/api/")):
             return await self.app(scope, receive, send)
         ip = client_key((scope.get("client") or ("unknown",))[0])
-        per_minute, burst = RATE_AUTH if path.startswith("/api/auth/") else RATE_API
-        wait = _take(ip, "auth" if path.startswith("/api/auth/") else "api", per_minute, burst)
+        # Sign-in is throttled hard; signing out is not (a user throttled on sign-in must still be able to leave).
+        auth = path.startswith("/api/auth/") and path not in ("/api/auth/logout", "/api/auth/logout-all")
+        per_minute, burst = RATE_AUTH if auth else RATE_API
+        wait = _take(ip, "auth" if auth else "api", per_minute, burst)
         if wait:
             return await _reply(send, 429, "too many requests", [(b"retry-after", str(math.ceil(wait)).encode())])
         declared = dict(scope["headers"]).get(b"content-length", b"0")
@@ -143,18 +151,40 @@ async def check_origin(request: Request, call_next):
 app.add_middleware(Guard)  # added after check_origin, so it wraps it
 
 
+def _log_503(request: Request, exc: DBAPIError) -> None:
+    """The exception class and SQLSTATE only: str(exc) carries the SQL and its parameters."""
+    log.warning("503 on %s %s: %s, sqlstate %s", request.method, request.url.path, type(exc.orig).__name__,
+                getattr(exc.orig, "sqlstate", None))
+
+
 @app.exception_handler(DBAPIError)
 async def database_error(request: Request, exc: DBAPIError):
     """Timeouts, a full disk or shared memory, too many connections, a lost connection: busy, not a crash."""
     if isinstance(exc.orig, QueryCanceled):
+        _log_503(request, exc)
         return JSONResponse({"detail": "query took too long, narrow the search"}, status_code=503)
     if isinstance(exc.orig, OperationalError):
+        _log_503(request, exc)
         return JSONResponse(BUSY, status_code=503)
     raise exc
 
 
+def _clean(value, limit: int = 300):
+    """A str that is safe to encode as UTF-8, cut to `limit` characters; other values pass as they are."""
+    return value[:limit].encode("utf-8", "replace").decode("utf-8") if isinstance(value, str) else value
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    """422 with where and why, never the offending input (it can be huge, NaN or not encodable as UTF-8)."""
+    return JSONResponse({"detail": [
+        {"type": _clean(e["type"]), "loc": [_clean(p) for p in e["loc"]], "msg": _clean(e["msg"])}
+        for e in exc.errors()]}, status_code=422)
+
+
 @app.exception_handler(PoolTimeout)
 async def pool_exhausted(request: Request, exc: PoolTimeout):
+    log.warning("503 on %s %s: %s (no pooled connection)", request.method, request.url.path, type(exc).__name__)
     return JSONResponse(BUSY, status_code=503)
 
 
@@ -209,7 +239,7 @@ def list_builds():
 
 
 @app.get("/api/builds/{label}")
-def get_build(label: str):
+def get_build(label: Text):
     with get_engine().connect() as conn:
         row = _get_build(conn, label)
         areas = conn.execute(
@@ -230,7 +260,7 @@ def get_build(label: str):
 
 @app.get("/api/builds/{label}/assets")
 def list_assets(
-    label: str,
+    label: Text,
     area: Filter = None,
     status: Literal["added", "removed", "modified", "moved"] | None = None,
     type: Filter = None,
@@ -342,7 +372,7 @@ def resolve_asset(conn, path: str):
 
 
 @app.get("/api/asset")
-def get_asset(path: Annotated[str, Query(max_length=1000, pattern=r"^[^\x00]*$")], field: Filter = None):
+def get_asset(path: Annotated[str, Query(max_length=1000, pattern=r"^[^\x00]*$"), Utf8], field: Filter = None):
     with get_engine().connect() as conn:
         row = resolve_asset(conn, path)
         if row is None:
@@ -385,8 +415,8 @@ def get_asset(path: Annotated[str, Query(max_length=1000, pattern=r"^[^\x00]*$")
 
 @app.get("/api/changes")
 def list_changes(
-    field: Annotated[str, Query(min_length=2, max_length=200, pattern=r"^[^\x00]*$")],
-    build_label: Annotated[str | None, Query(alias="build", max_length=200, pattern=r"^[^\x00]*$")] = None,
+    field: Annotated[str, Query(min_length=2, max_length=200, pattern=r"^[^\x00]*$"), Utf8],
+    build_label: Annotated[str | None, Query(alias="build", max_length=200, pattern=r"^[^\x00]*$"), Utf8] = None,
     area: Filter = None,
     op: Literal["added", "removed", "changed", "resequenced"] | None = None,
     limit: Limit = 50,

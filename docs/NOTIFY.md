@@ -4,12 +4,16 @@ After a build is ingested, `tracker notify --label <label>` sends one Discord we
 subscription that the build matches. The update pipeline runs it right after `tracker ingest`.
 
 ```
-tracker notify --label s3-26000000 [--dry-run]
+tracker notify --label s3-26000000 [--dry-run] [--deadline-seconds 1800]
 ```
 
 Needs `DATABASE_URL` and `PUBLIC_ORIGIN` (for links). `--dry-run` prints what would be sent and writes nothing.
-Exit code 0 when every due message was sent, 1 when any failed (the rest are still sent), 2 for usage errors
-(unknown or not ingested label).
+Exit code 0 when every due message was sent, 1 when any failed (the rest are still sent) or the run deadline cut
+the run short, 2 for usage errors (unknown or not ingested label).
+
+`--deadline-seconds` (default 1800) bounds the whole run. Once that much time has passed since sending began, no
+further message is started (the one under way may take up to its 60 s budget more). The subscriptions not reached get
+no `delivery` row, so a re-run sends exactly those; the run prints how many were skipped and exits 1.
 
 ## Matching
 
@@ -72,6 +76,8 @@ continues with the others. Before sending, the stored URL is checked again again
 
 - 2xx → `status = sent`.
 - 429 → wait `retry_after` (from the JSON body, capped at 30 s) and retry, up to 3 attempts in total; then `failed`.
+  A `retry_after` that is missing, not a number (a string, `null`, a boolean), not finite (NaN, Infinity) or negative
+  counts as 1 s.
   All 429 waits of one subscription add up to at most 40 s.
 - 5xx or a network error/timeout (10 s) → retry up to 3 attempts with 1 s, 4 s backoff; then `failed`.
 - 401, 403 or 404 → the webhook is gone: `failed`, and set `subscription.disabled_at = now()`. No retry.

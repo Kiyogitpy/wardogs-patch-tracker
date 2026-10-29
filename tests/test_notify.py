@@ -734,3 +734,54 @@ def test_429_waits_up_to_the_cap_are_taken(conn_db):
     assert len(h.requests) == 3 and h.sleeps == [20, 20]
     row = delivery_rows(conn_db)[0]
     assert row[:3] == (sub, "failed", 3) and row[3].startswith("HTTP 429")
+
+
+# ---------- bounded run and retry_after ----------
+
+def test_run_deadline_stops_sending_and_leaves_the_rest_for_a_rerun(conn_db):
+    subs = [subscribe(conn_db, "area", "vehicles", hook=HOOK + str(i)) for i in range(4)]
+    now = [1000.0]
+
+    def handle(request):
+        now[0] += 6  # each message takes 6 fake seconds
+        return httpx.Response(204)
+
+    h = Hook()
+    h.use(handle)
+    s = notify(conn_db, "b2", ORIGIN, h.client, sleep=h.sleeps.append, clock=lambda: now[0], deadline_seconds=10)
+    assert (s["sent"], s["skipped"]) == (2, 2) and len(h.requests) == 2
+    assert [r[0] for r in delivery_rows(conn_db)] == subs[:2]  # the skipped two have no delivery row
+    # A re-run picks up exactly the skipped ones.
+    h2 = Hook(204)
+    s2 = h2.run(conn_db)
+    assert (s2["sent"], s2["skipped"]) == (2, 0) and len(h2.requests) == 2
+    assert [r[0] for r in delivery_rows(conn_db)] == subs
+
+
+def test_cli_run_deadline_prints_the_skipped_count_and_exits_1(conn_db, monkeypatch, capsys):
+    for i in range(3):
+        subscribe(conn_db, "area", "vehicles", hook=HOOK + str(i))
+    real = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda *a, **k: real(transport=httpx.MockTransport(lambda r: httpx.Response(204))))
+    assert run_cli(conn_db, monkeypatch, "--label", "b2", "--deadline-seconds", "0") == 1
+    assert "3 subscription(s) were not sent" in capsys.readouterr().err
+    assert delivery_rows(conn_db) == []
+    assert run_cli(conn_db, monkeypatch, "--label", "b2") == 0  # the default deadline is far away
+    assert len(delivery_rows(conn_db)) == 3
+
+
+def test_default_run_deadline_is_30_minutes():
+    assert notify_mod.RUN_DEADLINE == 1800
+
+
+@pytest.mark.parametrize("body, wait", [
+    ('{"retry_after": NaN}', 1.0), ('{"retry_after": Infinity}', 1.0), ('{"retry_after": -Infinity}', 1.0),
+    ('{"retry_after": -3}', 1.0), ('{"retry_after": "5"}', 1.0), ('{"retry_after": "soon"}', 1.0),
+    ('{"retry_after": null}', 1.0), ('{"retry_after": true}', 1.0), ('{"retry_after": [2]}', 1.0),
+    ('{"retry_after": 1e999}', 1.0), ('{"retry_after": 1' + '0' * 400 + '}', 1.0),
+    ('[1]', 1.0), ('not json', 1.0), ('{}', 1.0),
+    ('{"retry_after": 0}', 0.0), ('{"retry_after": 2.5}', 2.5), ('{"retry_after": 600}', 30),
+])
+def test_retry_after_that_is_not_a_finite_non_negative_number_waits_one_second(body, wait):
+    response = httpx.Response(429, content=body.encode())
+    assert notify_mod._retry_after(response) == wait

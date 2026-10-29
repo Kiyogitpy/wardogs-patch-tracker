@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState } from 'react'
+import { clearWebhook, forgetWebhookUnlessOwnedBy } from './account'
 import { getMe, type Me } from './api'
 
 export type MeState = { state: 'loading' } | { state: 'out' } | { state: 'in'; me: Me }
@@ -10,13 +11,19 @@ export function MeProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const ctl = new AbortController()
     getMe(ctl.signal).then(
-      (m) => setMe(m ? { state: 'in', me: m } : { state: 'out' }),
+      (m) => {
+        forgetWebhookUnlessOwnedBy(m?.discord_id ?? null)
+        setMe(m ? { state: 'in', me: m } : { state: 'out' })
+      },
       // The API being down is not a reason to hide the whole site: treat it as signed out.
       () => !ctl.signal.aborted && setMe({ state: 'out' }),
     )
     return () => ctl.abort()
   }, [])
-  return <Ctx value={{ me, signedOut: () => setMe({ state: 'out' }) }}>{children}</Ctx>
+  return <Ctx value={{ me, signedOut: () => {
+      clearWebhook()
+      setMe({ state: 'out' })
+    } }}>{children}</Ctx>
 }
 
 export const useMe = () => useContext(Ctx)
