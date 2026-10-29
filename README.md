@@ -37,7 +37,7 @@ stored; `season_diff.py` owns that classification. Migrations are in `migrations
 
 1. ~~Schema and ingest~~
 2. ~~API (`docs/API.md`) and the build diff view~~
-3. Field history across builds and search
+3. ~~Field history across builds and search~~ (design: `docs/DESIGN.md`)
 4. Public deployment; Discord OAuth login for subscriptions to assets, areas or field patterns, delivered by Discord
    webhook after each ingest
 
