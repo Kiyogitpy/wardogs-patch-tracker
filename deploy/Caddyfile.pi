@@ -1,0 +1,21 @@
+# Pi behind Tailscale Funnel: plain http on loopback only; Funnel terminates TLS.
+{
+	auto_https off
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			idle 2m
+		}
+		# Funnel connects from the host (seen here as the Docker bridge gateway, a private address).
+		# Nothing else can reach this port: compose publishes it on 127.0.0.1 only.
+		trusted_proxies static private_ranges
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+import /etc/caddy/common.caddy
+
+:8080 {
+	import site
+}

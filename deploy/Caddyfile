@@ -1,4 +1,15 @@
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			idle 2m
+		}
+	}
+}
+
+import /etc/caddy/common.caddy
+
 {$DOMAIN} {
-	encode zstd gzip
-	reverse_proxy app:8000
+	import site
 }

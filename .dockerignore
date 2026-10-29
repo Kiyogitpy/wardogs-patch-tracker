@@ -12,4 +12,5 @@ docs
 *.md
 !README.md
 compose*.yaml
-deploy
+deploy/*
+!deploy/db_setup.py

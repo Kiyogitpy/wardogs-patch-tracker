@@ -1,0 +1,27 @@
+# Shared by Caddyfile (public TLS) and Caddyfile.pi (Tailscale Funnel). Import inside a site block.
+(site) {
+	encode zstd gzip
+
+	# The web app needs no request bodies and the API takes small JSON, so cap every path.
+	request_body {
+		max_size 64KB
+	}
+
+	# Defence in depth: tracker.server already sends these on every response. "?" sets a header only
+	# when the app did not; defer applies it after the upstream response, so the two never fight.
+	header {
+		?Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		?X-Content-Type-Options "nosniff"
+		?Cross-Origin-Opener-Policy "same-origin"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		?X-Frame-Options "DENY"
+		-Server
+		defer
+	}
+
+	reverse_proxy app:8000 {
+		# One address only: the client as Caddy sees it (spoofed X-Forwarded-For from untrusted
+		# peers is already discarded). uvicorn trusts just the proxy network and reads this value.
+		header_up X-Forwarded-For {client_ip}
+	}
+}
