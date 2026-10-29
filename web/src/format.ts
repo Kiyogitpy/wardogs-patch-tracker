@@ -1,0 +1,62 @@
+import type { Json } from './api'
+
+const MINUS = '−'
+
+/** Trim float noise (0.1+0.2) to 6 significant digits. */
+export function fmtNumber(n: number): string {
+  if (!Number.isFinite(n)) return String(n)
+  return String(Number(n.toPrecision(6)))
+}
+
+function signed(n: number, text: string): string {
+  if (n > 0) return `+${text}`
+  if (n < 0) return `${MINUS}${text.replace('-', '')}`
+  return text
+}
+
+export interface Delta {
+  delta: string // "−15"
+  pct: string | null // "−25%"; null when before is 0
+}
+
+/** Delta and percent for number -> number changes; null for anything else. */
+export function numericDelta(before: Json, after: Json): Delta | null {
+  if (typeof before !== 'number' || typeof after !== 'number') return null
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return null
+  const d = Number((after - before).toPrecision(12))
+  const delta = signed(d, fmtNumber(d))
+  if (before === 0) return { delta, pct: null }
+  const p = (d / Math.abs(before)) * 100
+  const rounded = Math.abs(p) < 10 ? Number(p.toFixed(1)) : Math.round(p)
+  return { delta, pct: `${signed(rounded, String(rounded))}%` }
+}
+
+export const COLLAPSE_CHARS = 80
+export const COLLAPSE_LINES = 3
+
+export function pretty(v: Json): string {
+  return JSON.stringify(v, null, 2)
+}
+
+/** Arrays/objects whose pretty form is long, and long strings, get an expand control. */
+export function isLong(v: Json): boolean {
+  if (typeof v === 'string') return v.length > 120 || v.includes('\n')
+  if (v === null || typeof v !== 'object') return false
+  const text = pretty(v)
+  return text.length > COLLAPSE_CHARS || text.split('\n').length > COLLAPSE_LINES
+}
+
+/** Inline text for a scalar, or a short summary for a collapsed container. */
+export function inlineText(v: Json): string {
+  if (v === null) return 'null'
+  if (typeof v === 'number') return fmtNumber(v)
+  if (typeof v === 'string') return v === '' ? '""' : v
+  if (typeof v === 'boolean') return String(v)
+  if (Array.isArray(v)) return `[${v.length} item${v.length === 1 ? '' : 's'}]`
+  const n = Object.keys(v).length
+  return `{${n} key${n === 1 ? '' : 's'}}`
+}
+
+export function totalAssets(c: { added: number; removed: number; modified: number; moved: number }): number {
+  return c.added + c.removed + c.modified + c.moved
+}
