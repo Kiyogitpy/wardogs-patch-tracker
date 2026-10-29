@@ -28,7 +28,7 @@ def engine():
 def db(engine):
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE build, asset, asset_alias, asset_status, change, build_area, "
-                          "app_user, session, subscription, delivery RESTART IDENTITY CASCADE"))
+                          "app_user, session, oauth_state, subscription, delivery RESTART IDENTITY CASCADE"))
     return engine
 
 

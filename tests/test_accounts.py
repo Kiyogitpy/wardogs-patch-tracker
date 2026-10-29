@@ -476,3 +476,158 @@ def test_webhook_ids_with_leading_zeros_are_the_same_webhook():
 def test_leading_zero_duplicate_is_409(user):
     assert post(user).status_code == 201
     assert post(user, webhook_url="https://discord.com/api/webhooks/01234567890/abcdefghijk3Zq").status_code == 409
+
+
+# --- server-side single-use state ---------------------------------------------------------------------------------
+
+def start_login(client, next_path=None):
+    """(state, state cookie value) of a fresh login."""
+    r = client.get("/api/auth/login", params={"next": next_path} if next_path else {})
+    return parse_qs(urlparse(r.headers["location"]).query)["state"][0], client.cookies.get(STATE)
+
+
+def finish(client, state, cookie, code="fake-code"):
+    return client.get("/api/auth/callback", params={"code": code, "state": state}, headers={"Cookie": f"{STATE}={cookie}"})
+
+
+@pytest.fixture
+def no_exchange(monkeypatch):
+    """Records the codes the callback sends to an exchange slot; the tests below expect none."""
+    called = []
+    monkeypatch.setattr(accounts, "_exchange", lambda code: called.append(code))
+    return called
+
+
+def test_login_stores_only_the_hash_of_the_state(client, world):
+    state, _ = start_login(client, "/asset?path=x")
+    with world.connect() as conn:
+        row = conn.execute(text("SELECT state_hash, next, expires_at > now() AS live FROM oauth_state")).one()
+    assert row.state_hash == hashlib.sha256(state.encode()).hexdigest() and row.next == "/asset?path=x" and row.live
+
+
+def test_forged_cookie_and_state_never_reach_a_slot_or_discord(client, discord, no_exchange):
+    packed = base64.urlsafe_b64encode(b"/").decode().rstrip("=")
+    r = finish(client, "forged-state", f"forged-state.{packed}")
+    assert r.status_code == 302 and r.headers["location"] == "/?signin=failed"
+    assert no_exchange == [] and discord["requests"] == []
+
+
+def test_real_state_with_a_mismatching_cookie_is_refused_and_stays_usable(client, discord, world):
+    state, cookie = start_login(client)
+    assert finish(client, state, "other." + cookie.partition(".")[2]).headers["location"] == "/?signin=failed"
+    assert discord["requests"] == []
+    assert finish(client, state, cookie).headers["location"] == "/"  # a refused attempt did not burn the state
+
+
+def test_replayed_state_fails_the_second_time(client, discord, world):
+    state, cookie = start_login(client)
+    assert finish(client, state, cookie).headers["location"] == "/"
+    assert len(discord["requests"]) == 2
+    assert finish(client, state, cookie).headers["location"] == "/?signin=failed"
+    assert len(discord["requests"]) == 2 and count(world, "oauth_state") == 0
+
+
+def test_expired_state_fails_without_contacting_discord(client, discord, world, no_exchange):
+    state, cookie = start_login(client)
+    with world.begin() as conn:
+        conn.execute(text("UPDATE oauth_state SET expires_at = now() - interval '1 second'"))
+    assert finish(client, state, cookie).headers["location"] == "/?signin=failed"
+    assert no_exchange == [] and discord["requests"] == []
+
+
+def test_login_purges_expired_states(client, world):
+    start_login(client)
+    with world.begin() as conn:
+        conn.execute(text("UPDATE oauth_state SET expires_at = now() - interval '1 second'"))
+    start_login(client)
+    assert count(world, "oauth_state") == 1
+
+
+def test_next_comes_from_the_server_side_row(client, discord, world):
+    state, cookie = start_login(client, "/changes?field=x")
+    packed = base64.urlsafe_b64encode(b"/evil").decode().rstrip("=")
+    assert finish(client, state, f"{state}.{packed}").headers["location"] == "/changes?field=x"
+
+
+# --- overall deadline for the Discord exchange --------------------------------------------------------------------
+
+@pytest.fixture
+def slow_discord(monkeypatch):
+    """Discord on a fake clock: each call advances it by state["took"][i] seconds and records its timeout."""
+    clock = [1000.0]
+    state = {"took": [], "timeouts": [], "paths": []}
+
+    def handler(request):
+        state["timeouts"].append(request.extensions["timeout"]["read"])
+        state["paths"].append(request.url.path)
+        clock[0] += state["took"][len(state["paths"]) - 1]
+        if request.url.path == "/api/oauth2/token":
+            return httpx.Response(200, json={"access_token": "fake-access"})
+        return httpx.Response(200, json=ME)
+
+    monkeypatch.setattr(accounts, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(accounts, "http_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+    return state
+
+
+def test_exchange_has_one_deadline_shared_by_both_calls(client, world, slow_discord):
+    slow_discord["took"] = [3.0, 1.0]
+    state, cookie = start_login(client)
+    assert finish(client, state, cookie).headers["location"] == "/"
+    t_token, t_profile = slow_discord["timeouts"]
+    assert t_token == pytest.approx(accounts.EXCHANGE_DEADLINE, abs=0.01)
+    assert t_profile == pytest.approx(accounts.EXCHANGE_DEADLINE - 3.0, abs=0.01)  # what the token call left
+
+
+def test_exchange_past_the_deadline_fails_before_the_profile_call(client, world, slow_discord):
+    slow_discord["took"] = [accounts.EXCHANGE_DEADLINE + 1, 0]
+    state, cookie = start_login(client)
+    assert finish(client, state, cookie).headers["location"] == "/?signin=failed"
+    assert slow_discord["paths"] == ["/api/oauth2/token"] and count(world, "session") == 0
+
+
+# --- sessions -----------------------------------------------------------------------------------------------------
+
+def test_oauth_state_table_and_session_expiry_index_exist(world):
+    with world.connect() as conn:
+        names = set(conn.execute(text("SELECT indexname FROM pg_indexes WHERE tablename IN ('session', 'oauth_state')"))
+                    .scalars())
+    assert {"ix_session_expires_at", "ix_oauth_state_expires_at"} <= names
+
+
+def test_a_user_keeps_at_most_10_sessions_newest_win(client, discord, world):
+    tokens = []
+    for _ in range(12):
+        assert sign_in(client, discord).status_code == 302
+        tokens.append(client.cookies.get(SESSION))
+    with world.connect() as conn:
+        left = set(conn.execute(text("SELECT token_hash FROM session")).scalars())
+    assert left == {hashlib.sha256(t.encode()).hexdigest() for t in tokens[2:]}
+    assert client.get("/api/me").status_code == 200  # the newest one is the one in the cookie
+
+
+def test_session_cap_is_per_user(client, discord, world):
+    for i in range(11):
+        sign_in(client, discord, {**ME, "id": str(1000 + i), "username": f"u{i}"})
+    sign_in(client, discord)
+    assert count(world, "session") == 12
+
+
+def test_logout_all_ends_every_session_of_this_user_only(world, discord):
+    a1, a2, other = new_client(), new_client(), new_client()
+    sign_in(a1, discord)
+    sign_in(a2, discord)
+    sign_in(other, discord, {**ME, "id": "5", "username": "someone"})
+    assert count(world, "session") == 3
+    r = a1.post("/api/auth/logout-all", headers=HEADERS)
+    assert r.status_code == 204
+    assert a1.get("/api/me").status_code == 401 and a2.get("/api/me").status_code == 401
+    assert other.get("/api/me").status_code == 200 and count(world, "session") == 1
+    assert SESSION in r.headers["set-cookie"] and "max-age=0" in r.headers["set-cookie"].lower()
+
+
+def test_logout_all_needs_a_session_and_the_origin_rules(client, discord, user):
+    assert new_client().post("/api/auth/logout-all", headers=HEADERS).status_code == 401
+    assert user.post("/api/auth/logout-all").status_code == 403
+    assert user.post("/api/auth/logout-all", headers={"Origin": "https://evil.test"}).status_code == 403
+    assert user.get("/api/me").status_code == 200  # the refused attempts did nothing

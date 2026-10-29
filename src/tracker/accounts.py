@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
@@ -20,7 +21,7 @@ from sqlalchemy import delete, exists, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
-from tracker.db import app_user, asset, build, build_area, delivery, session, subscription
+from tracker.db import app_user, asset, build, build_area, delivery, oauth_state, session, subscription
 from tracker.webhooks import canonical
 
 
@@ -37,6 +38,8 @@ DISCORD_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_ME = "https://discord.com/api/users/@me"
 SESSION_TTL = timedelta(days=30)
 STATE_TTL = 600
+MAX_SESSIONS = 10  # per user; a login beyond it ends the user's oldest
+EXCHANGE_DEADLINE = 8.0  # seconds for the whole Discord exchange (token call and profile call together)
 MAX_SUBSCRIPTIONS = 25
 MAX_NEXT = 500
 MAX_EXCHANGES = 4  # concurrent Discord code exchanges; tests patch it
@@ -44,9 +47,13 @@ AVATAR_RE = re.compile(r"[A-Za-z0-9_]{1,64}", re.ASCII)
 FAILED = "/?signin=failed"
 
 
+_monotonic = time.monotonic  # tests replace it
+
+
 def http_client() -> httpx.Client:
-    """Factory for the Discord HTTP client; tests replace it with one on httpx.MockTransport."""
-    return httpx.Client(timeout=10.0)
+    """Factory for the Discord HTTP client; tests replace it with one on httpx.MockTransport.
+    Every call passes its own timeout, cut from the exchange deadline."""
+    return httpx.Client()
 
 
 def _public_origin() -> str:
@@ -100,7 +107,13 @@ def login(next: str | None = None):
     if not client_id or not os.environ.get("DISCORD_CLIENT_SECRET") or not _public_origin():
         raise HTTPException(503, "sign-in is not configured")
     state = secrets.token_urlsafe(32)
-    packed = base64.urlsafe_b64encode(_safe_next(next).encode()).decode().rstrip("=")
+    next_path = _safe_next(next)
+    packed = base64.urlsafe_b64encode(next_path.encode()).decode().rstrip("=")
+    with _api().get_engine().begin() as conn:  # the state must exist here to be accepted by the callback
+        conn.execute(delete(oauth_state).where(oauth_state.c.expires_at <= func.now()))
+        conn.execute(insert(oauth_state).values(
+            state_hash=_hash(state), next=next_path,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=STATE_TTL)))
     query = urlencode({"client_id": client_id, "redirect_uri": _public_origin() + "/api/auth/callback",
                        "response_type": "code", "scope": "identify", "state": state, "prompt": "none"})
     response = RedirectResponse(f"{DISCORD_AUTHORIZE}?{query}", status_code=302)
@@ -121,20 +134,34 @@ def _parse_state_cookie(cookie: str | None, state: str | None) -> str | None:
         return "/"
 
 
+class _DeadlinePassed(Exception):
+    pass
+
+
 def _discord_user(code: str) -> dict | None:
-    """Exchange the code and read the profile; None on any Discord failure. Neither secret is logged."""
+    """Exchange the code and read the profile; None on any Discord failure. Neither secret is logged.
+    Both calls share one wall-clock deadline: each gets what is left of EXCHANGE_DEADLINE as its timeout."""
+    deadline = _monotonic() + EXCHANGE_DEADLINE
+
+    def left() -> float:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            raise _DeadlinePassed
+        return remaining
+
     try:
         with http_client() as client:
-            token = client.post(DISCORD_TOKEN, data={
+            token = client.post(DISCORD_TOKEN, timeout=left(), data={
                 "client_id": os.environ["DISCORD_CLIENT_ID"], "client_secret": os.environ["DISCORD_CLIENT_SECRET"],
                 "grant_type": "authorization_code", "code": code,
                 "redirect_uri": _public_origin() + "/api/auth/callback"})
             token.raise_for_status()
             access = token.json()["access_token"]
-            me = client.get(DISCORD_ME, headers={"Authorization": f"Bearer {access}"})
+            me = client.get(DISCORD_ME, headers={"Authorization": f"Bearer {access}"}, timeout=left())
             me.raise_for_status()
             profile = me.json()
-    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            left()  # a profile that arrived after the deadline is not used
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, _DeadlinePassed):
         return None
     if (not isinstance(profile, dict) or not isinstance(profile.get("id"), str)
             or not re.fullmatch(r"\d{1,20}", profile["id"], re.ASCII)
@@ -169,6 +196,12 @@ def callback(request: Request, code: str | None = None, state: str | None = None
     next_path = _parse_state_cookie(request.cookies.get(cookie_name("oauth_state")), state)
     if error or next_path is None or not code or len(code) > 512 or not _public_origin():
         return _failed()
+    with _api().get_engine().begin() as conn:  # single use: taking the row is what lets this callback go on
+        row = conn.execute(delete(oauth_state).where(oauth_state.c.state_hash == _hash(state))
+                           .returning(oauth_state.c.next, oauth_state.c.expires_at > func.now())).first()
+    if row is None or not row[1]:
+        return _failed()
+    next_path = _safe_next(row[0])
     user = _exchange(code)
     if user is None:
         return _failed()
@@ -183,6 +216,10 @@ def callback(request: Request, code: str | None = None, state: str | None = None
         conn.execute(delete(session).where(session.c.expires_at <= func.now()))  # everyone's, so the table stays small
         conn.execute(insert(session).values(token_hash=_hash(token), user_id=user_id,
                                             expires_at=datetime.now(timezone.utc) + SESSION_TTL))
+        newest = (select(session.c.token_hash).where(session.c.user_id == user_id, session.c.token_hash != _hash(token))
+                  .order_by(session.c.created_at.desc(), session.c.token_hash).limit(MAX_SESSIONS - 1))
+        conn.execute(delete(session).where(session.c.user_id == user_id, session.c.token_hash != _hash(token),
+                                           session.c.token_hash.not_in(newest)))  # the user's oldest beyond the cap
     response = RedirectResponse(next_path, status_code=302)
     _clear_cookie(response, cookie_name("oauth_state"), _state_path())
     _set_cookie(response, cookie_name("session"), token, int(SESSION_TTL.total_seconds()), "/")
@@ -214,6 +251,15 @@ def current_user(request: Request):
 
 User = Annotated[object, Depends(current_user)]
 NO_STORE = {"Cache-Control": "no-store"}
+
+
+@router.post("/auth/logout-all", status_code=204)
+def logout_all(request: Request, user: User):
+    with _api().get_engine().begin() as conn:
+        conn.execute(delete(session).where(session.c.user_id == user.id))
+    response = Response(status_code=204)
+    _clear_cookie(response, cookie_name("session"), "/")
+    return response
 
 
 @router.get("/me")
