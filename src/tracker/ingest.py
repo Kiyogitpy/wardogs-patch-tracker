@@ -1,5 +1,6 @@
 """Load one `season_diff.py` output directory into the database as one build."""
 import json
+import math
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -17,14 +18,76 @@ class TotalsMismatch(Exception):
     pass
 
 
+MAX_VALUE_BYTES = 1 << 20  # one before/after value, serialized
+MAX_FIELD_PATH = 1000
+MAX_NAME = 300
+MAX_PATH = 1000
+
+
+def _read_json(path: Path):
+    def no_constants(token):
+        raise ValueError(f"{path.name}: {token} is not valid JSON")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), parse_constant=no_constants)
+    except RecursionError:
+        raise ValueError(f"{path.name}: JSON nested too deeply") from None
+
+
+def _area_files(diff_dir: Path, area: dict) -> list[Path]:
+    """The area's files, each required to resolve inside the diff directory (no absolute paths, `..` or symlinks out)."""
+    root = diff_dir.resolve()
+    names = area["file"] if isinstance(area["file"], list) else [area["file"]]
+    files = []
+    for name in names:
+        if not isinstance(name, str) or not name or "\x00" in name or Path(name).is_absolute() or name.startswith(("/", "\\")):
+            raise ValueError(f"area {area['id']}: file {name!r} must be a relative path inside the diff directory")
+        resolved = (root / name).resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"area {area['id']}: file {name!r} leaves the diff directory")
+        files.append(resolved)
+    return files
+
+
+def _check_entry(entry: dict) -> None:
+    """Reject what Postgres cannot store or what would make the site or the notifier misbehave."""
+    path = entry.get("path")
+    who = f"asset {path!r}"[:200]
+    stack = [entry]
+    while stack:  # every string, key and number anywhere in the entry
+        v = stack.pop()
+        if isinstance(v, str):
+            if "\x00" in v:
+                raise ValueError(f"{who}: contains a NUL character")
+        elif isinstance(v, float):
+            if not math.isfinite(v):
+                raise ValueError(f"{who}: contains a non-finite number")
+        elif isinstance(v, dict):
+            for k, item in v.items():
+                stack.append(k)
+                stack.append(item)
+        elif isinstance(v, list):
+            stack.extend(v)
+    for key, limit in (("name", MAX_NAME), ("path", MAX_PATH), ("old_path", MAX_PATH)):
+        if isinstance(entry.get(key), str) and len(entry[key]) > limit:
+            raise ValueError(f"{who}: {key} is {len(entry[key])} characters, the limit is {limit}")
+    for c in entry["changes"]:
+        if len(c["path"]) > MAX_FIELD_PATH:
+            raise ValueError(f"{who}: field path of {len(c['path'])} characters, the limit is {MAX_FIELD_PATH}: {c['path'][:60]!r}")
+        for side in ("before", "after"):
+            size = len(json.dumps(c[side], ensure_ascii=False).encode())
+            if size > MAX_VALUE_BYTES:
+                raise ValueError(f"{who}: {side} value of {c['path'][:60]!r} is {size} bytes, the limit is {MAX_VALUE_BYTES}")
+
+
 def load_diff(diff_dir: Path) -> tuple[dict, list[tuple[str, dict]]]:
-    """Return index.json and every (area id, asset entry). Large areas are split over several files."""
-    index = json.loads((diff_dir / "index.json").read_text(encoding="utf-8"))
+    """Return index.json and every (area id, asset entry). Large areas are split over several files.
+    Everything is checked here, before the caller writes anything."""
+    index = _read_json(diff_dir / "index.json")
     entries = []
     for area in index["areas"]:
-        files = area["file"] if isinstance(area["file"], list) else [area["file"]]
-        for name in files:
-            for entry in json.loads((diff_dir / name).read_text(encoding="utf-8"))["assets"]:
+        for file in _area_files(diff_dir, area):
+            for entry in _read_json(file)["assets"]:
+                _check_entry(entry)
                 entries.append((area["id"], entry))
     return index, entries
 

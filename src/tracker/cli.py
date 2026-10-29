@@ -38,6 +38,9 @@ def main(argv: list[str] | None = None) -> int:
     except TotalsMismatch as e:
         print(f"tracker: totals do not match index.json, nothing was written: {e}", file=sys.stderr)
         return 1
+    except ValueError as e:  # a bad diff (also bad JSON): nothing was written
+        print(f"tracker: bad diff, nothing was written: {e}", file=sys.stderr)
+        return 1
     print(f"ingested {args.label}: {result['assets']} assets, {result['changes']} changes; totals match index.json")
     return 0
 
