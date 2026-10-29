@@ -44,11 +44,17 @@ One webhook `POST` per subscription, JSON body:
 - Game text is hostile and never rendered as Markdown. Field paths and non-numeric values go in a code span (backticks
   inside them are replaced with `ˋ`, so the span cannot be closed). Names, area titles and targets in titles and bold
   prefixes are backslash-escaped (\  *  _  ~  |  >  [  ]  (  )  #  <  `, a leading `-`, `+` or `1.`), newlines become spaces, and
-  `://` is written `:\/\/` so no bare URL is clickable.
-- Discord limits: title ≤ 256 characters, description ≤ 4096, footer ≤ 2048, `url` ≤ 2048, and title + description +
-  footer ≤ 6000 (the description shrinks to fit). Truncate with `…` and end with "and N more" plus the link. Values
-  are shortened to 80 characters, field paths to 200, names to 100 (before escaping, so a cut never splits an
-  escape). If the link would exceed 2048 characters (a very long asset path) it points at `/builds/<B>` instead.
+  `://` is written `:\/\/` so no bare URL is clickable. A bare domain (`evil.com/login`, `discord.gg/x`,
+  `www.evil.com`) would be autolinked too, so a zero-width space (U+200B) is put after every `.` that sits between
+  word characters (`evil.<ZWSP>com`): it reads the same and is no longer a link. Unicode format characters (category
+  Cf: right-to-left override and the isolates, joiners, BOM, soft hyphen) are removed from game text, in escaped text
+  and in code spans alike; the only one left in a message is the zero-width space added here.
+- Discord limits: title ≤ 256, description ≤ 4096, footer ≤ 2048, `url` ≤ 2048, and title + description +
+  footer ≤ 6000 (the description shrinks to fit). Discord counts UTF-16 code units, so the first three and the total
+  are budgeted in UTF-16 units (an emoji is 2), never in Python characters, and a cut never splits a surrogate
+  pair. Truncate with `…` and end with "and N more" plus the link. Values
+  are shortened to 80, field paths to 200, names to 100 (before escaping, so a cut never splits an
+  escape; the same units). If the link would exceed 2048 characters (a very long asset path) it points at `/builds/<B>` instead.
 - Numbers at or beyond 1e300 in magnitude, and any pair whose difference cannot be computed, are shown as plain
   values without a delta.
 - Links: asset → `/asset?path=`, area → `/builds/<B>?area=<id>`, field → `/changes?field=<target>&build=<B>`, all
@@ -66,9 +72,15 @@ continues with the others. Before sending, the stored URL is checked again again
 
 - 2xx → `status = sent`.
 - 429 → wait `retry_after` (from the JSON body, capped at 30 s) and retry, up to 3 attempts in total; then `failed`.
+  All 429 waits of one subscription add up to at most 40 s.
 - 5xx or a network error/timeout (10 s) → retry up to 3 attempts with 1 s, 4 s backoff; then `failed`.
 - 401, 403 or 404 → the webhook is gone: `failed`, and set `subscription.disabled_at = now()`. No retry.
 - Other 4xx → `failed`, no retry.
+
+Each subscription has a wall-clock budget of 60 s over all its attempts, waits included (each request's timeout is cut
+to what is left). When the next wait would not fit in the budget, or the 429 waits would pass their 40 s total, the
+subscription stops and is recorded `failed` with `last_error = "time budget exhausted"`; the next run retries it. The
+notify database engine has a 60 s `statement_timeout`.
 
 `attempts` counts tries across runs, `last_error` holds the status code and at most 300 characters of the response
 (never the webhook URL). A re-run sends only subscriptions with no `sent` row for that build, so running notify twice

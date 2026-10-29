@@ -225,7 +225,8 @@ everything read-only keeps working.
 ### Cookies and CSRF
 
 - `__Host-oauth_state`: random 32-byte URL-safe value, HttpOnly, Secure, SameSite=Lax, path `/`, no Domain, 10 minutes. It also
-  carries the `next` path (see below), e.g. `<state>.<base64url(next)>`.
+  carries the `next` path (see below), e.g. `<state>.<base64url(next)>`. The cookie alone proves nothing: the state is
+  also stored server-side (`oauth_state`: SHA-256 of the state, `next`, `expires_at`), see the callback.
 - `__Host-session`: random 32-byte URL-safe token, HttpOnly, Secure, SameSite=Lax, path `/`, no Domain, 30 days.
 - The `__Host-` prefix needs `Secure`. With `COOKIE_SECURE=0` (plain http dev) the names are `oauth_state` (path
   `/api/auth`) and `session`, without `Secure`. The database stores only its
@@ -237,21 +238,33 @@ everything read-only keeps working.
 
 302 to `https://discord.com/oauth2/authorize` with `client_id`, `redirect_uri`, `response_type=code`, `scope=identify`,
 `state`, `prompt=none`. `next` must start with `/` and not with `//` or `/\`; anything else becomes `/` (no open
-redirect).
+redirect). The SHA-256 of the state is stored with `next` and a 10 minute expiry; each login first deletes every
+expired state.
 
 ### `GET /api/auth/callback?code=&state=`
 
-Checks `state` against the cookie (constant-time), exchanges the code at `https://discord.com/api/oauth2/token`,
+Checks `state` against the cookie (constant-time; this still stops login CSRF), then takes the state's row from
+`oauth_state` with one `DELETE ... RETURNING`: the row must exist and not be expired, and it can be taken only once, so a
+replayed or forged state fails. `next` comes from that row. All of this happens before an exchange slot is taken or
+Discord is contacted, so forged callbacks cannot occupy the exchange slots. Then it exchanges the code at
+`https://discord.com/api/oauth2/token`,
 reads `https://discord.com/api/users/@me`, upserts `app_user` by `discord_id` (refreshing `username`, `avatar`,
 `last_login_at`), creates a session, clears `oauth_state`, sets `session`, and 302s to `next`. Any failure (missing or
 wrong state, Discord error, `error=access_denied`) 302s to `/?signin=failed` without creating a session. Discord
-calls time out after 10 s. At most 4 code exchanges run at once; over that, the callback 302s to `/?signin=failed`
+calls share one 8 s deadline (the token call and the profile call together; each call's timeout is what is left of it).
+At most 4 code exchanges run at once; over that, the callback 302s to `/?signin=failed`
 at once. A Discord username with a control character (NUL, newline, ...) fails sign-in the same way. Each sign-in also
-deletes every expired session, not just the user's own.
+deletes every expired session, not just the user's own, and a user keeps at most 10 sessions: a sign-in beyond that ends
+the user's oldest ones.
 
 ### `POST /api/auth/logout`
 
 Deletes the session row, clears the cookie. 204, also when already signed out.
+
+### `POST /api/auth/logout-all`
+
+Deletes every session of the signed-in user (all browsers and devices), clears the cookie. 204. Needs a session (401
+`{"detail": "not signed in"}` otherwise) and the same `Origin` rule as every non-GET request (403 `bad origin`).
 
 ### `GET /api/me`
 
@@ -307,6 +320,11 @@ FastAPI defaults: 404 `{"detail": "..."}`, 422 validation body. Besides those, a
   bytes of a chunked request (reading stops at the limit). This runs before authentication.
 - 429 `{"detail": "too many requests"}` with a `Retry-After` header (seconds): a per-client-IP token bucket kept in
   memory, 10 requests a minute (burst 5) for `/api/auth/*` and 120 a minute (burst 60) for everything else. The IP is
-  the connection's client address, which uvicorn's proxy-headers sets from the trusted proxy.
+  the connection's client address, which uvicorn's proxy-headers sets from the trusted proxy. An IPv4 address is its
+  own bucket; an IPv6 address shares one bucket with its whole /64 (an IPv4-mapped IPv6 address counts as the IPv4
+  address).
 - 503 `{"detail": "query took too long, narrow the search"}`: a read query exceeded the API's 3 s `statement_timeout`.
+- 503 `{"detail": "the database is busy, try again shortly"}`: the database refused or lost the work (disk or shared
+  memory full, too many connections, connection lost), or no pooled connection became free within 5 s. Retry later.
+- A trailing slash is not redirected: `/api/builds/` is a 404.
 
