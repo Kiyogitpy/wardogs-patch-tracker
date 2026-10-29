@@ -6,11 +6,11 @@ One Docker host (a VPS or similar), three containers behind Docker Compose:
 internet -> caddy (80/443, automatic HTTPS) -> app (API + web, :8000) -> db (Postgres 16)
 ```
 
-Only Caddy publishes ports. `app` and `db` are reachable only on the compose network. Everything is in `compose.prod.yaml`; settings are in `.env`. A one-shot `migrate` service runs before `app` (see "Database roles"). For a Raspberry Pi behind Tailscale Funnel use `compose.pi.yaml` instead (see that section below).
+Only Caddy publishes ports. `app` and `db` are reachable only on the compose network. Caddy serves the web app's static files itself (a copy of `web/dist` baked into the Caddy image) and proxies only `/api/*` to the app. Everything is in `compose.prod.yaml`; settings are in `.env`. A one-shot `migrate` service runs before `app` (see "Database roles"). For a Raspberry Pi behind Tailscale Funnel use `compose.pi.yaml` instead (see that section below).
 
 ## First deploy
 
-1. **Host**: any Linux box with Docker Engine and the Compose plugin. Open ports 80 and 443, and UDP 443 (HTTP/3; compose publishes it).
+1. **Host**: any Linux box with **Docker Engine 28 or newer** and the Compose plugin (`docker version`). Engine 28 stopped exposing container ports to the local network through direct routing and keeps ports published on `127.0.0.1` reachable from the host only; older engines let neighbours on the LAN reach what you meant to keep private. Open exactly 80/tcp, 443/tcp and 443/udp (HTTP/3; compose publishes it), and set up the firewall as described in "Firewall" below. The server files are `compose.prod.yaml` and `compose.pi.yaml`; a bare `docker compose up` does nothing (the dev database lives in `compose.dev.yaml`).
 2. **DNS**: create an `A` record (and `AAAA` if the host has IPv6) for your hostname, for example `tracker.example.com`, pointing at the host. Caddy can only get a certificate once this resolves to the host.
 3. **Discord application** (for sign-in): at <https://discord.com/developers/applications> create an application. Under OAuth2 add the redirect URI `https://<domain>/api/auth/callback`. The scope used is `identify`. Copy the client ID and the client secret.
 4. **Get the code** onto the host (`git clone`), then in the repo root:
@@ -75,8 +75,11 @@ docker tag wardogs-patch-tracker:latest wardogs-patch-tracker:previous
 Backup (custom format, safe while running):
 
 ```
-docker compose -f compose.prod.yaml exec -T db pg_dump -U tracker -Fc tracker > backup-$(date +%F).dump
+( umask 077; docker compose -f compose.prod.yaml exec -T db pg_dump -U tracker -Fc tracker > backup-$(date +%F).dump )
+chmod 600 backup-*.dump
 ```
+
+**A dump contains secrets**: webhook URLs (a webhook URL is a credential: anyone holding it can post to that channel), Discord user ids and session data. Hence `umask 077` (the file is created owner-only; a plain `>` would make it readable by everyone under the default umask) and `chmod 600`. Keep dumps out of shared directories, and encrypt every copy that leaves the host, for example with age (`age -r <public-key> -o backup.dump.age backup.dump`, decrypt with `age -d -i key.txt backup.dump.age`) or gpg (`gpg --encrypt --recipient <you> backup.dump`). Keep the private key somewhere other than the backup target, and delete any plaintext copy made only for the upload.
 
 Restore into the running stack (replaces the data):
 
@@ -87,7 +90,7 @@ docker compose -f compose.prod.yaml exec -T db pg_restore -U tracker -d tracker 
 docker compose -f compose.prod.yaml start app
 ```
 
-Automate the backup with cron and copy the dumps off the host; the `pgdata` volume is the only copy otherwise. The restore path was tested against this stack (21,976 change rows round-tripped).
+Automate the backup with cron and copy the (encrypted) dumps off the host; the `pgdata` volume is the only copy otherwise. The restore path was tested against this stack (21,976 change rows round-tripped).
 
 ## Rollback
 
@@ -106,18 +109,49 @@ Two roles, two URLs:
 
 `deploy/db_setup.py` creates or refreshes the role on every deploy (idempotent; a password change in `.env` applies on the next `up`). It runs in a startup service rather than `docker-entrypoint-initdb.d` because init scripts run only on an empty volume, so they would never reach an existing database. A new migration needs no grant changes: tables made by the owner are covered by the default privileges.
 
+`tracker_app` extras, all set by `db_setup.py`:
+
+- No `TEMP` privilege (revoked from `PUBLIC` and from the role): it cannot create temporary tables.
+- `statement_timeout = 5s` as the role default, so a runaway query in `tracker ingest`/`notify` or an ad-hoc session is cancelled. A session may still `SET statement_timeout` itself (the API sets its own value), so this guards against accidents, not against a compromised app.
+- `CONNECTION LIMIT 20`, above the API pool's maximum (15) plus a CLI run. Keep it above your pool size: on Postgres 16.15 (Docker) a burst of simultaneous connections beyond a role's limit made the postmaster crash-restart the whole server (a backend exited with code 2, observed with a plain test role too), so never aim load tools at this role.
+- The script refuses empty, whitespace-only and placeholder passwords (`change-me`, `changeme`, `password`, any case) for both roles, and a role name equal to the owner, `postgres` or `pg_*`.
+- The password is sent as a SCRAM verifier, and the session turns statement logging off (`log_min_error_statement = panic`, `log_statement = none`), so a failed `CREATE`/`ALTER ROLE` cannot leave the plaintext in the Postgres log.
+
 `docker compose run app tracker ingest ...` and `exec app tracker notify ...` use `DATABASE_URL`, so they run as `tracker_app`.
 
 Upgrading an existing deployment: add `MIGRATE_DATABASE_URL` (the old owner URL) and change `DATABASE_URL` to `tracker_app` with a new password, then `up -d`.
 
+## Firewall
+
+Docker publishes ports by writing its own NAT and forward rules, which are evaluated before `ufw`/`firewalld` rules. `ufw deny 5432` does nothing for a published port, and the ports compose publishes are open whatever `ufw status` says. Two things do work:
+
+1. **Publish only what you want, on the address you want.** Compose here publishes only Caddy: `80`, `443/tcp` and `443/udp` on the VPS (`compose.prod.yaml`), `127.0.0.1:8080` on the Pi. `app` and `db` publish nothing; keep it that way (never add `ports:` to them). To bind to one address instead of all, write `"203.0.113.10:443:443"` in the `ports` entries.
+2. **Filter in the `DOCKER-USER` chain**, the one iptables chain Docker never rewrites and evaluates before its own rules. Example that lets only the three public ports through to containers and drops other new inbound connections (replace `eth0` with the public interface; persist with `iptables-persistent` or a systemd unit):
+
+   ```
+   iptables -I DOCKER-USER -i eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+   iptables -A DOCKER-USER -i eth0 -p tcp -m multiport --dports 80,443 -j ACCEPT
+   iptables -A DOCKER-USER -i eth0 -p udp --dport 443 -j ACCEPT
+   iptables -A DOCKER-USER -i eth0 -j DROP
+   ```
+
+   DOCKER-USER sees the destination port **after** DNAT, that is the container's port (`80`, `443`), which is what the rules above match even if you change `HTTP_PORT`/`HTTPS_PORT`. Add the same with `ip6tables` if Docker IPv6 is on.
+
+**VPS**: open inbound 80/tcp, 443/tcp and 443/udp, plus SSH (ideally from your address only). Nothing else, in particular not 5432 or 8000.
+
+**Raspberry Pi**: nothing inbound from the internet. Funnel makes an outbound connection to Tailscale. Allow SSH only from the LAN or the tailnet (for example `ufw allow from 192.168.1.0/24 to any port 22`). Port 8080 is bound to `127.0.0.1`, so the LAN cannot reach it on Engine 28 or newer.
+
+Verify from a different machine: `nmap -Pn -p 22,80,443,5432,8000,8080 <host>` must show only the ports you meant to open; on the host, `ss -ltnp` must list only `0.0.0.0:80`/`:443` (VPS) or `127.0.0.1:8080` (Pi) from Docker.
+
 ## Updating pinned images
 
-All images are pinned to exact tags: `node`, `python` and `ghcr.io/astral-sh/uv` in the `Dockerfile`, `postgres` and `caddy` in `compose.prod.yaml` and `compose.pi.yaml`. All are multi-arch (amd64 and arm64). To update: pick the new tag (Docker Hub tags page; `docker buildx imagetools inspect <image:tag>` should list `linux/arm64`), change it in every file (`grep -rn "postgres:16\|caddy:2\|python:3\|node:24\|astral-sh/uv:" Dockerfile compose*.yaml`), rebuild and run the tests. Minor Postgres updates (16.x) are safe; a new major needs a dump and restore. For reproducible builds you can also append a digest (`image:tag@sha256:...`, from `imagetools inspect`), at the cost of updating it by hand.
+All images are pinned to exact tags: `node`, `python`, `caddy` and `ghcr.io/astral-sh/uv` in the `Dockerfile`, `postgres` in `compose.prod.yaml` and `compose.pi.yaml`. The app image's last stage holds only the finished virtualenv and the app: no `uv`, `pip`, `setuptools` or `wheel` (check with `docker scout cves <image>`). The Caddy image is built from the pinned `caddy` tag with the web app copied in (`docker compose build caddy`). All are multi-arch (amd64 and arm64). To update: pick the new tag (Docker Hub tags page; `docker buildx imagetools inspect <image:tag>` should list `linux/arm64`), change it in every file (`grep -rn "postgres:16\|caddy:2\|python:3\|node:24\|astral-sh/uv:" Dockerfile compose*.yaml`; `compose.dev.yaml` uses the floating `postgres:16` on purpose), rebuild and run the tests. Minor Postgres updates (16.x) are safe; a new major needs a dump and restore. For reproducible builds you can also append a digest (`image:tag@sha256:...`, from `imagetools inspect`), at the cost of updating it by hand.
 
 ## Notes
 
-- **Forwarded headers**: Caddy sets `X-Forwarded-For` to the single client address it sees (anything the client sent is dropped). uvicorn trusts `X-Forwarded-*` only from `172.29.57.0/24`, the fixed `edge` network that holds just `caddy` and `app` (`FORWARDED_ALLOW_IPS` in the compose files). If that subnet clashes with something on your host, change it in both places. Never publish port 8000 to the host.
-- `--limit-concurrency 64`: uvicorn answers 503 beyond 64 simultaneous connections/requests (Caddy's idle keep-alive connections count). Raise it if you see 503s under real load.
+- **Forwarded headers**: Caddy sets `X-Forwarded-For` to the single client address it sees (anything the client sent is dropped). uvicorn trusts `X-Forwarded-*` from exactly one address: Caddy's fixed address on the `edge` network (`CADDY_IP`, via `FORWARDED_ALLOW_IPS` in the compose files), not the whole subnet, because the subnet also contains the host gateway and any other container you attach. The network is defined once per file from `EDGE_SUBNET`, `EDGE_GATEWAY` and `CADDY_IP` (defaults `172.29.57.0/24`, `.1`, `.254` in `compose.prod.yaml`; `172.29.58.0/24`, `.1`, `.254` in `compose.pi.yaml`, so both can run on one host). The network definition and the trust setting read the same variables, so they cannot drift. If a subnet clashes with something on your host, set all three in `.env`, keeping `CADDY_IP` near the top of the subnet (Docker hands other containers addresses from the bottom). Never publish port 8000 to the host.
+- **No `--limit-concurrency`**: uvicorn used to answer 503 beyond 64 simultaneous connections, which let 150 looped static GETs push the API and the healthcheck into 503s (measured: 8,246 of 27,543 static requests and 64 of 164 API probes got 503). It is gone. Load is bounded by the containers' `mem_limit` and `pids_limit` and by the app's per-IP limiter on `/api` (429), and the static files are served by Caddy, so a flood of them never reaches Python. The same flood now gives 0 503s.
+- **Caddy runs as a non-root user** (uid 65532) with only `NET_BIND_SERVICE`. Its `caddy_data` and `caddy_config` volumes must be writable by that uid. New volumes get the right ownership from the image; on an existing deployment whose volumes were made by the old root image, run once: `docker compose -f compose.prod.yaml run --rm --no-deps -u 0 --entrypoint chown caddy -R 65532:65532 /data /config` (certificates are kept). With `DOMAIN=localhost` a "failed to install root certificate" log line is expected (a non-root process cannot touch the trust store); use `curl -k`.
 - Local test without a domain: set `DOMAIN=localhost`, `PUBLIC_ORIGIN=https://localhost:8443`, `HTTP_PORT=8080`, `HTTPS_PORT=8443` in `.env`. Caddy issues an internal certificate (use `curl -k`).
 - **Restart policy**: containers use `restart: unless-stopped`, which restarts a container that exits (crash, OOM kill) and starts it again after a reboot. Docker does **not** restart a container that is only `unhealthy`; healthchecks gate start order and show in `docker compose ps`. For a hung service run `docker compose restart app`, or add a watchdog that watches health.
 - The API docs (`/docs`, `/redoc`, `/openapi.json`) are not served in production; they exist only in dev (`uvicorn tracker.api:app`).
@@ -126,22 +160,24 @@ All images are pinned to exact tags: `node`, `python` and `ghcr.io/astral-sh/uv`
 
 - TLS everywhere, automatic certificates and renewal; HTTP redirects to HTTPS; HTTP/3 (UDP 443 is published).
 - Every response from the app carries `Strict-Transport-Security`, `X-Content-Type-Options`, `Cross-Origin-Opener-Policy`, `Referrer-Policy` and `X-Frame-Options`; HTML adds a CSP (`default-src 'self'`, Google Fonts and `cdn.discordapp.com` avatars allowed, `frame-ancestors 'none'`, `object-src 'none'`, `upgrade-insecure-requests`) and `Permissions-Policy`. Caddy adds the same headers only when the app did not.
-- Caddy: 64 KB request body cap on every path (413 beyond it), `read_header 10s`, `read_body 30s`, `idle 2m` timeouts.
+- Caddy: 64 KB request body cap on every path (413 beyond it); `read_header 10s`, `read_body 30s`, `idle 2m` timeouts on every listener, port 80 included.
+- Every response Caddy writes itself carries the security headers: the 413, the http to https redirect, an unknown `Host` (404), error pages and the 405. `Server` and `Via` are removed.
 - The uvicorn access log drops query strings, so OAuth `code`/`state` values never reach the logs.
-- The app refuses to start with a `change-me` URL or a missing or non-https `PUBLIC_ORIGIN` (`http://localhost...` only with `COOKIE_SECURE=0`).
-- `app` and `caddy` run with a read-only root filesystem (`/tmp` is a small tmpfs), all capabilities dropped (Caddy keeps `NET_BIND_SERVICE`), `no-new-privileges`, and memory and process limits. `db` has `no-new-privileges` and a memory limit. `app` runs as a non-root user.
+- The app refuses to start with an empty or placeholder database password (`change-me`, `changeme`, `password`, any case), or unless `PUBLIC_ORIGIN` is exactly `https://host[:port]` (no path, query, fragment, user info or whitespace). `COOKIE_SECURE=0` is accepted only together with `http://localhost` or `http://127.0.0.1`, and that origin only with `COOKIE_SECURE=0`.
+- `app` and `caddy` run with a read-only root filesystem (`/tmp` is a small tmpfs), all capabilities dropped (Caddy keeps `NET_BIND_SERVICE`), `no-new-privileges`, and memory and process limits. `db` has `no-new-privileges` and limits but a writable root filesystem (Postgres needs it). `app` and `caddy` run as non-root users. Every service logs with `json-file`, rotated at 3 files of 10 MB.
 - The app uses a DML-only database role (see "Database roles"); `db` is on an internal network with no outside access.
 - `COOKIE_SECURE=1`; secrets only in `.env` (git- and image-excluded), never in images.
 - Static serving resists path traversal and lists no directories; `/api/*` never falls back to the web app.
 - Container healthchecks and restart policy; `app` waits for `migrate`, Caddy for a healthy app.
 - Server version header is off; responses are gzip/zstd compressed.
-- Images pinned to exact tags.
+- Images pinned to exact tags, at the newest patch releases of `caddy` 2.11, `postgres` 16 and `python` 3.13 at the time of writing. The app image has no `uv`, `pip` or `setuptools`.
 
 ## Not in place
 
 - **Rate limiting at the proxy**: Caddy has none (it needs a custom build with `xcaddy`). The app has its own limits in code; for more, limit at the host or provider firewall.
 - No automated backups, log shipping or monitoring.
 - Image digests are not pinned (tags only).
+- The Caddy image still reports Go standard library and `golang.org/x/net` CVEs in `docker scout`, because they are compiled into the newest `caddy` release; they clear when upstream ships a rebuilt tag (bump the tag in the `Dockerfile`).
 
 ## Raspberry Pi with Tailscale Funnel
 
@@ -152,24 +188,48 @@ internet -> Tailscale relay (TLS) -> tailscaled on the Pi -> 127.0.0.1:8080 cadd
 ```
 
 1. **OS**: 64-bit Raspberry Pi OS (or Ubuntu) on a Pi 4 or 5 with 4 GB or more. The 32-bit OS cannot run the arm64 Postgres and Caddy images. Check with `uname -m` (`aarch64`).
-2. **Docker**: install Docker Engine and the Compose plugin from Docker's apt repository (<https://docs.docker.com/engine/install/debian/>). Every image used is multi-arch and has a `linux/arm64` manifest.
+2. **Docker**: install **Docker Engine 28 or newer** and the Compose plugin from Docker's apt repository (<https://docs.docker.com/engine/install/debian/>); Debian's own `docker.io` package is usually older. Engine 28 is what keeps the loopback-published Caddy port (`127.0.0.1:8080`) off the LAN and blocks direct routing to container ports. Check `docker version`. Every image used is multi-arch and has a `linux/arm64` manifest.
 3. **Tailscale**: install it (<https://tailscale.com/download/linux>), then `sudo tailscale up`. In the admin console enable HTTPS certificates (DNS page) and make sure your policy lets this node use Funnel (the `funnel` node attribute).
 4. **Configure**: `cp deploy/.env.example .env`, `chmod 600 .env`. Set `PUBLIC_ORIGIN=https://<host>.<tailnet>.ts.net` (see `tailscale status`), the two database URLs and passwords, the Discord keys and `COOKIE_SECURE=1`. `DOMAIN` is not used.
 5. **Start**: `docker compose -f compose.pi.yaml up -d --build` (the first build on a Pi takes a while). Check `curl -i http://127.0.0.1:8080/api/builds`.
 6. **Expose**: `sudo tailscale funnel --bg 8080`. Funnel listens externally only on 443, 8443 and 10000; the number you pass is the local port. Verify with `tailscale funnel status` and from another network: `https://<host>.<tailnet>.ts.net/`.
 7. **Discord**: add the redirect URI `https://<host>.<tailnet>.ts.net/api/auth/callback` to the application (step 3 of "First deploy").
-8. **Only this service on Funnel.** `tailscale funnel` exposes just the port you name. Leave SSH and every other Pi service off Funnel: never run `tailscale funnel` for them, keep them bound to localhost or the tailnet, and keep SSH on key authentication. Check that `tailscale funnel status` lists only 8080.
-9. **Backups off the Pi.** The Pi's storage is otherwise the only copy of the data. Run the `pg_dump` from "Backup and restore" from cron (use `-f compose.pi.yaml`) and copy the dump to another machine or object storage (`rclone`, `scp`, a NAS). Test a restore.
+8. **Only this service on Funnel.** `tailscale funnel` exposes just the port you name. Leave SSH and every other Pi service off Funnel, keep them bound to localhost or the tailnet, and keep SSH on key authentication. **Scope check, after every Tailscale change and before announcing the URL:** `tailscale funnel status` must show exactly one entry, `https://<host>.<tailnet>.ts.net (Funnel on)` proxying to `http://127.0.0.1:8080`, and nothing else; `tailscale serve status` shows the same set. Anything extra is public: remove it with `sudo tailscale funnel --https=<port> off`.
+9. **Backups off the Pi.** The Pi's storage is otherwise the only copy of the data. Run the `pg_dump` from "Backup and restore" from cron (use `-f compose.pi.yaml`; keep the `umask 077`/`chmod 600`, the dump contains webhook URLs), encrypt it with age or gpg, and copy it to another machine or object storage (`rclone`, `scp`, a NAS). Test a restore. Also open nothing inbound on the Pi apart from SSH from the LAN or tailnet (see "Firewall").
 10. **Storage**: Postgres writes constantly, and SD cards wear out and can corrupt on power loss. Prefer a USB SSD for the OS or at least the Docker data root (`/var/lib/docker`); if you stay on an SD card, use a high-endurance card and keep frequent off-Pi backups.
 
 ### Client IP behind Funnel
 
-The in-app rate limiter keys on the address uvicorn reports, so the real visitor address has to survive the hops: Funnel (on the host) -> Docker port mapping -> Caddy -> uvicorn.
+The in-app rate limiter keys on the address uvicorn reports, so the real visitor address has to survive the hops: Funnel (tailscaled on the host) -> Docker port mapping -> Caddy -> uvicorn.
 
-- Funnel/Serve's reverse proxy (tailscaled, `ipn/ipnlocal/serve.go`) sets `X-Forwarded-For` to the visitor's source address (taken from the ingress node's `Tailscale-Ingress-Src` header), plus `X-Forwarded-Host` and, over TLS, `X-Forwarded-Proto: https`. For Funnel requests it also sets `Tailscale-Funnel-Request: ?1` and omits the `Tailscale-User-*` identity headers. It uses `Header.Set`, so a value sent by the visitor is replaced.
-- `Caddyfile.pi` sets `trusted_proxies static private_ranges` and `client_ip_headers X-Forwarded-For`. The Funnel connection reaches Caddy through Docker's port mapping, so Caddy sees it from the bridge gateway (a private address) and trusts it. Caddy then forwards a single `X-Forwarded-For: <client>` upstream, and uvicorn trusts only the `edge` subnet (`172.29.57.0/24`), so it reports the visitor as the client.
-- The port is published on `127.0.0.1` only, so the only peers that can set the header are Funnel and processes on the Pi itself. Any local process could spoof a client address; keep untrusted code off the host.
+- Caddy sees the Funnel connection coming from the `edge` network's gateway (`EDGE_GATEWAY`, `172.29.58.1` by default), because the host reaches the container through Docker's port mapping. `Caddyfile.pi` trusts **only that address** (`trusted_proxies static <gateway>/32`), not `private_ranges`: every other container on the host also has a private address, and a trusted peer may set the client address.
+- `trusted_proxies_strict` makes Caddy walk `X-Forwarded-For` from the right and take the **rightmost untrusted entry**. Entries to its left are whatever the visitor sent and are never believed. Caddy then forwards a single `X-Forwarded-For: <client>` and uvicorn trusts only Caddy's own address (`CADDY_IP`).
+- A connection from any other address (another container, even one on the same network) is untrusted, so its `X-Forwarded-For` is ignored and the app sees that container's own address.
 
-Verified here: Caddy's and uvicorn's trust handling. With the Pi stack up, `curl -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:8080/api/builds` appears in the app's access log as client `203.0.113.9`; in the standard stack, where Caddy does not trust the sender, a spoofed header is ignored and the log shows the real peer.
+What Funnel does with the header decides the result. From Tailscale's source (`ipn/ipnlocal/serve.go`) the Serve/Funnel proxy sets `X-Forwarded-For` to the visitor's address with `Header.Set`; the user documentation does not promise it, and no Funnel node was available to test. The three possibilities:
 
-Not verified (no Funnel node available): that Funnel sends the header as the code reads. That is inferred from Tailscale's source (`serve.go`); the user documentation does not mention it. After your first Funnel request, check `docker compose -f compose.pi.yaml logs app`: the client in the access log must be your public address, not `172.29.57.1`. If it shows the gateway, Funnel did not send the header and the limiter would see one shared address.
+| Funnel does | Caddy's `client_ip` | Effect |
+|---|---|---|
+| Replaces the header (expected) | the visitor | correct, per-visitor limiting |
+| Appends to what the visitor sent (`forged, visitor`) | the visitor (rightmost) | correct; the forged entry is ignored |
+| Omits the header (visitor's own header passes through, or none) | the gateway if none was sent; **the visitor's forged value if one was sent** | no header: every visitor shares one limiter bucket (one noisy client can make everyone get 429); passed through: the limiter can be dodged by forging the header |
+
+**First-request check (do this before sharing the URL).** From a network that is not yours (phone data, not Wi-Fi):
+
+```
+curl -s -o /dev/null https://<host>.<tailnet>.ts.net/api/builds
+curl -s -o /dev/null -H 'X-Forwarded-For: 1.2.3.4' https://<host>.<tailnet>.ts.net/api/builds
+docker compose -f compose.pi.yaml logs --tail 4 app
+```
+
+Both log lines must show **your public address** as the client. If you see `172.29.58.1` (or your `EDGE_GATEWAY`), Funnel sends no header: the app works but limits everyone together. If you see `1.2.3.4`, Funnel passes the visitor's header through unchanged: stop the funnel (`sudo tailscale funnel --https=443 off`) and tell the maintainers, the limiter is bypassable.
+
+Remaining limit: anything that can open the loopback port from the host looks exactly like Funnel and may set the client address (any local process; on Docker Desktop even a container reaching `host.docker.internal`). On a Linux host with Engine 28 or newer other containers cannot reach a `127.0.0.1`-published port. Keep untrusted code off the Pi.
+
+Verified here with the Pi stack (`-p wpt-fix2-pi`, `PI_PORT=58090`), reading the app's access log:
+
+- from the trusted hop, `X-Forwarded-For: 203.0.113.9` -> client `203.0.113.9`;
+- from the trusted hop, `X-Forwarded-For: 1.2.3.4, 10.0.0.1` -> client `10.0.0.1` (rightmost untrusted);
+- from the trusted hop without the header -> client `172.29.58.1` (the gateway);
+- from another container on the `edge` network straight to Caddy (`172.29.58.254:8080`), `X-Forwarded-For: 6.6.6.6` or `1.2.3.4, 10.0.0.1` -> client is that container's own address `172.29.58.3`;
+- from a container straight to `app:8000` with a forged header -> client is the container's own address (uvicorn trusts only Caddy).

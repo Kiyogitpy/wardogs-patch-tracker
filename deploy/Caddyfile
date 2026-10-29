@@ -1,15 +1,44 @@
 {
-	servers {
+	servers :443 {
 		timeouts {
 			read_header 10s
 			read_body 30s
 			idle 2m
 		}
 	}
+	servers :80 {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			idle 2m
+		}
+	}
+	# Explicit redirect below, so it carries the security headers and the host's published port.
+	auto_https disable_redirects
 }
 
 import /etc/caddy/common.caddy
 
-{$DOMAIN} {
+# The second address makes this site answer any Host on this certificate's name, so a request
+# with a foreign Host header reaches the guard below (404 with headers) instead of Caddy's bare
+# empty 200.
+{$DOMAIN}, https:// {
+	import headers
+	@wrong not host {$DOMAIN}
+	handle @wrong {
+		respond "Not Found" 404
+	}
 	import site
+}
+
+# http -> https. PUBLIC_ORIGIN keeps a non-default published port (tests) in the Location.
+http://{$DOMAIN} {
+	import headers
+	redir {$PUBLIC_ORIGIN}{uri} permanent
+}
+
+# Any other Host over http (IP address, wrong name): headers, no content.
+http:// {
+	import headers
+	respond "Not Found" 404
 }

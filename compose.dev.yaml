@@ -1,3 +1,4 @@
+name: wardogs-patch-tracker  # keeps the dev project (and its volume) stable under the new file name
 services:
   db:
     image: postgres:16

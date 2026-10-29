@@ -1,14 +1,9 @@
-# Shared by Caddyfile (public TLS) and Caddyfile.pi (Tailscale Funnel). Import inside a site block.
-(site) {
-	encode zstd gzip
+# Shared by Caddyfile (public TLS) and Caddyfile.pi (Tailscale Funnel).
 
-	# The web app needs no request bodies and the API takes small JSON, so cap every path.
-	request_body {
-		max_size 64KB
-	}
-
-	# Defence in depth: tracker.server already sends these on every response. "?" sets a header only
-	# when the app did not; defer applies it after the upstream response, so the two never fight.
+# Security headers on every response Caddy writes: static files, proxied responses, the 413 from
+# request_body, redirects, the unknown-Host answer and handle_errors. "?" sets a header only when
+# the app did not already; defer applies it after the handler (and after errors) have run.
+(headers) {
 	header {
 		?Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		?X-Content-Type-Options "nosniff"
@@ -16,12 +11,72 @@
 		?Referrer-Policy "strict-origin-when-cross-origin"
 		?X-Frame-Options "DENY"
 		-Server
+		-Via
 		defer
 	}
+}
 
-	reverse_proxy app:8000 {
-		# One address only: the client as Caddy sees it (spoofed X-Forwarded-For from untrusted
-		# peers is already discarded). uvicorn trusts just the proxy network and reads this value.
-		header_up X-Forwarded-For {client_ip}
+(html_headers) {
+	Cache-Control "no-cache"
+	Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://cdn.discordapp.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests"
+	Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+}
+
+(site) {
+	import headers
+	encode zstd gzip
+
+	# The web app needs no request bodies and the API takes small JSON, so cap every path.
+	request_body {
+		max_size 64KB
+	}
+
+	# Only /api reaches Python. Everything else is served from the copy of web/dist baked into
+	# the Caddy image (/srv), so a static-file flood never queues behind the app.
+	@api path /api /api/*
+	handle @api {
+		reverse_proxy app:8000 {
+			# One address only: the client as Caddy sees it (see Caddyfile.pi for the trusted hop).
+			header_up X-Forwarded-For {client_ip}
+			header_down -Via
+		}
+	}
+
+	handle /assets/* {
+		# Hashed file names: cache for a year. A missing asset is a plain 404, never index.html.
+		header Cache-Control "public, max-age=31536000, immutable"
+		root * /srv
+		file_server
+	}
+
+	handle {
+		@write not method GET HEAD
+		header @write Allow "GET, HEAD"
+		respond @write "Method Not Allowed" 405
+
+		root * /srv
+		# Real files other than index.html (favicon...): short cache. Everything else is the SPA shell.
+		@real {
+			file {path}
+			not path /index.html
+		}
+		header @real Cache-Control "public, max-age=3600"
+		@shell not file {path}
+		header @shell {
+			import html_headers
+		}
+		@index path /index.html
+		header @index {
+			import html_headers
+		}
+		try_files {path} /index.html
+		file_server
+	}
+
+	handle_errors {
+		import headers
+		# An error from a long-cache route (missing /assets file) must not be cached with it.
+		header Cache-Control "no-store"
+		respond "{err.status_code} {err.status_text}" {err.status_code}
 	}
 }
