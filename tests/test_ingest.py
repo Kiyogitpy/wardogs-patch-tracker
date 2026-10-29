@@ -4,6 +4,7 @@ import shutil
 from datetime import date
 
 import pytest
+import sqlalchemy.exc
 from sqlalchemy import func, select
 
 from tracker import cli
@@ -322,3 +323,106 @@ def test_cli_disposes_its_engine(db, fixtures, monkeypatch):
     monkeypatch.setattr(cli, "create_engine", spy)
     assert run_ingest_cli(db, monkeypatch, fixtures / "diff_b2") == 0
     assert len(engines) == 1 and engines[0].pool.checkedin() == 0 and engines[0].pool.checkedout() == 0
+
+
+# ---------- types and enums the database relies on ----------
+
+def counts_zero(db):
+    with db.connect() as conn:
+        assert count(conn, build) == 0 and count(conn, asset) == 0 and count(conn, change) == 0
+
+
+@pytest.mark.parametrize("edit, match", [
+    (lambda e: e.update(status="deleted"), "status 'deleted' is not one of"),
+    (lambda e: e.update(status=["added"]), "is not one of"),
+    (lambda e: e["changes"][0].update(op="rewritten"), "change op 'rewritten' is not one of"),
+    (lambda e: e.update(exports="12"), "exports must be an integer or null"),
+    (lambda e: e.update(exports=1.5), "exports must be an integer or null"),
+    (lambda e: e.update(exports=True), "exports must be an integer or null"),
+    (lambda e: e.update(exports=2**40), "exports must be an integer or null"),
+    (lambda e: e["noise"].update(ref_shifts="3"), "noise.ref_shifts must be an integer"),
+    (lambda e: e["noise"].update(dup_keys=None), "noise.dup_keys must be an integer"),
+    (lambda e: e["noise"].update(dup_keys=1.0), "noise.dup_keys must be an integer"),
+    (lambda e: e.update(name="a\ud800"), "DA_Truck.*lone surrogate"),
+])
+def test_wrong_types_and_enums_are_clear_value_errors(db, fixtures, tmp_path, edit, match):
+    rejects(db, hostile_diff(fixtures, tmp_path, edit), match)
+
+
+def test_exports_may_be_null_or_an_int(db, fixtures, tmp_path):
+    with db.begin() as conn:
+        ingest(conn, hostile_diff(fixtures, tmp_path, lambda e: e.update(exports=7)), "b2")
+    with db.connect() as conn:
+        assert conn.execute(select(asset_status.c.exports).where(asset_status.c.exports == 7)).scalar_one() == 7
+
+
+@pytest.mark.parametrize("name, edit, match", [
+    ("index.json", lambda d: d["areas"][0].update(id=5), "area 0 id: must be a string"),
+    ("index.json", lambda d: d["areas"][0].update(title=None), "title: must be a string"),
+    ("index.json", lambda d: d["areas"][0].update(title="t\x00"), "title: contains a NUL"),
+    ("index.json", lambda d: d["areas"][0].update(file=3), "file must be a string or a list of strings"),
+    ("index.json", lambda d: d["areas"][0].update(file=["weapons-ammo-1.json", 3]), "file must be a string or a list"),
+])
+def test_area_types_are_validated(db, fixtures, tmp_path, name, edit, match):
+    diff = hostile_diff(fixtures, tmp_path)
+    edit_json(diff, name, edit)
+    rejects(db, diff, match)
+
+
+@pytest.mark.parametrize("manifest, match", [
+    ({"steam": {"buildid": 123}, "fingerprint": "f"}, r"manifest.steam.buildid: must be a string"),
+    ({"steam": {"buildid": "1\x00"}, "fingerprint": "f"}, r"manifest.steam.buildid: contains a NUL"),
+    ({"steam": {"buildid": "1"}, "fingerprint": None}, r"manifest.fingerprint: must be a string"),
+    ({"steam": {"buildid": "1"}, "fingerprint": "f\x00"}, r"manifest.fingerprint: contains a NUL"),
+])
+def test_manifest_types_are_validated(db, fixtures, manifest, match):
+    with pytest.raises(ValueError, match=match):
+        with db.begin() as conn:
+            ingest(conn, fixtures / "diff_b2", "b2", manifest=manifest)
+    counts_zero(db)
+
+
+def test_a_move_onto_another_existing_asset_is_refused(db, fixtures, tmp_path):
+    with db.begin() as conn:
+        ingest(conn, fixtures / "diff_b1", "b1", "b0")
+        old = conn.execute(select(asset.c.path)).scalar_one()
+        new = "Game/Other/Taken.json"
+        conn.execute(asset.insert().values(path=new, name="Taken", type="t"))
+        before = count(conn, asset)
+    diff = hostile_diff(fixtures, tmp_path, lambda e: e.update(old_path=old, path=new))
+    with pytest.raises(ValueError, match="both paths are existing assets"):
+        with db.begin() as conn:
+            ingest(conn, diff, "b2", "b1")
+    with db.connect() as conn:
+        assert count(conn, asset) == before and count(conn, build) == 2  # b0, b1; b2 was never written
+
+
+def test_a_move_onto_a_path_that_is_itself_moving_away_is_allowed(db, fixtures):
+    entries = [{"old_path": "a", "path": "b"}, {"old_path": "b", "path": "c"}]
+    with db.begin() as conn:
+        conn.execute(asset.insert(), [{"path": "a", "name": "a", "type": "t"}, {"path": "b", "name": "b", "type": "t"}])
+        from tracker.ingest import _check_moves
+        _check_moves(conn, entries)  # no error
+
+
+# ---------- the CLI separates database errors (3) from bad diffs (1) ----------
+
+@pytest.mark.parametrize("error", [
+    sqlalchemy.exc.IntegrityError("INSERT INTO asset VALUES (%(p)s)", {"p": "SECRET-PARAM"}, Exception("duplicate key")),
+    sqlalchemy.exc.OperationalError("SELECT 1", {}, Exception("connection lost")),
+    TypeError("expected str, got int"),
+])
+def test_cli_database_errors_exit_3_without_a_traceback(db, fixtures, monkeypatch, capsys, error):
+    def boom(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(cli, "ingest", boom)
+    assert run_ingest_cli(db, monkeypatch, fixtures / "diff_b2") == 3
+    err = capsys.readouterr().err
+    assert err.startswith("tracker: database error") and err.count("\n") == 1
+    assert "Traceback" not in err and "SECRET-PARAM" not in err and "INSERT" not in err
+
+
+def test_cli_bad_diff_still_exits_1(db, fixtures, tmp_path, monkeypatch, capsys):
+    diff = hostile_diff(fixtures, tmp_path, lambda e: e.update(status="deleted"))
+    assert run_ingest_cli(db, monkeypatch, diff) == 1
+    assert "bad diff" in capsys.readouterr().err

@@ -10,7 +10,7 @@ from pathlib import Path
 from sqlalchemy import Connection, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from tracker.db import asset, asset_alias, asset_status, build, build_area, change
+from tracker.db import ASSET_STATUSES, CHANGE_OPS, asset, asset_alias, asset_status, build, build_area, change
 
 STATUSES = ("added", "removed", "modified", "moved")
 NOISE_KEYS = ("renamed_keys", "ref_shifts", "dup_keys", "swapped_keys", "type_reinterpret")
@@ -24,6 +24,20 @@ MAX_VALUE_BYTES = 1 << 20  # one before/after value, serialized
 MAX_FIELD_PATH = 1000
 MAX_NAME = 300
 MAX_PATH = 1000
+MAX_INT4 = 2**31 - 1
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _text(v, where: str) -> str:
+    """v must be a string without NUL (Postgres text cannot hold it)."""
+    if not isinstance(v, str):
+        raise ValueError(f"{where}: must be a string, found {type(v).__name__}")
+    if "\x00" in v:
+        raise ValueError(f"{where}: contains a NUL character")
+    return v
 
 
 def _need(obj, where: str, *keys: str) -> None:
@@ -98,11 +112,21 @@ def _check_required(entry, where: str) -> None:
     for key in ("path", "name", "type"):
         if not isinstance(entry[key], str):
             raise ValueError(f"{where}: {key} must be a string")
+    if entry["status"] not in ASSET_STATUSES:
+        raise ValueError(f"{where}: status {str(entry['status'])[:40]!r} is not one of {', '.join(ASSET_STATUSES)}")
+    exports = entry.get("exports")
+    if exports is not None and not (_is_int(exports) and -MAX_INT4 - 1 <= exports <= MAX_INT4):
+        raise ValueError(f"{where}: exports must be an integer or null")
     _need(entry["noise"], f"{where} noise", *NOISE_KEYS)
+    for key in NOISE_KEYS:
+        if not _is_int(entry["noise"][key]):
+            raise ValueError(f"{where}: noise.{key} must be an integer")
     for c in _list(entry["changes"], f"{where} changes"):
         _need(c, f"{where} change", "path", "op", "before", "after")
         if not isinstance(c["path"], str):
             raise ValueError(f"{where}: change path must be a string")
+        if c["op"] not in CHANGE_OPS:
+            raise ValueError(f"{where}: change op {str(c['op'])[:40]!r} is not one of {', '.join(CHANGE_OPS)}")
 
 
 def _check_entry(entry: dict) -> None:
@@ -115,6 +139,10 @@ def _check_entry(entry: dict) -> None:
         if isinstance(v, str):
             if "\x00" in v:
                 raise ValueError(f"{who}: contains a NUL character")
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(f"{who}: contains a lone surrogate (not valid Unicode text)") from None
         elif isinstance(v, float):
             if not math.isfinite(v):
                 raise ValueError(f"{who}: contains a non-finite number")
@@ -146,6 +174,11 @@ def load_diff(diff_dir: Path) -> tuple[dict, list[tuple[str, dict]]]:
     entries = []
     for i, area in enumerate(_list(index["areas"], "index.json: areas")):
         _need(area, f"index.json area {i}", "id", "title", "file", "counts")
+        _text(area["id"], f"index.json area {i} id")
+        _text(area["title"], f"index.json area {area['id']} title")
+        if not isinstance(area["file"], str) and not (isinstance(area["file"], list)
+                                                      and all(isinstance(f, str) for f in area["file"])):
+            raise ValueError(f"index.json area {area['id']}: file must be a string or a list of strings")
         _need(area["counts"], f"index.json area {area['id']} counts")
         for file in _area_files(root, area):
             doc = _read_json(root, file)
@@ -159,7 +192,11 @@ def load_diff(diff_dir: Path) -> tuple[dict, list[tuple[str, dict]]]:
 
 def ingest(conn: Connection, diff_dir: Path, label: str, prev_label: str | None = None,
            manifest: dict | None = None, released_at: date | None = None) -> dict:
-    """Replace build `label` with the diff in `diff_dir`. Raises TotalsMismatch; the caller's transaction rolls back."""
+    """Replace build `label` with the diff in `diff_dir`. Raises TotalsMismatch; the caller's transaction rolls back.
+
+    `old_path` renames are trusted operator input: a moved entry renames the existing asset at its `old_path` (so it
+    keeps its history), and the diff is produced by the operator's own season_diff.py run. The one thing refused is a
+    rename onto a path that another existing asset already holds."""
     index, entries = load_diff(diff_dir)
     dupes = [p for p, n in Counter(e["path"] for _, e in entries).items() if n > 1]
     if dupes:
@@ -168,6 +205,9 @@ def ingest(conn: Connection, diff_dir: Path, label: str, prev_label: str | None 
     if manifest is not None:
         _need(manifest, "manifest", "steam", "fingerprint")
         _need(manifest["steam"], "manifest.steam", "buildid")
+        _text(manifest["steam"]["buildid"], "manifest.steam.buildid")
+        _text(manifest["fingerprint"], "manifest.fingerprint")
+    _check_moves(conn, [e for _, e in entries])
     values = {
         "prev_build_id": _ensure_build(conn, prev_label) if prev_label else None,
         "steam_buildid": manifest["steam"]["buildid"] if manifest else None,
@@ -215,6 +255,18 @@ def ingest(conn: Connection, diff_dir: Path, label: str, prev_label: str | None 
 
     check_totals(conn, build_id, index)
     return {"build_id": build_id, "assets": len(entries), "changes": len(changes)}
+
+
+def _check_moves(conn: Connection, entries: list[dict]) -> None:
+    """A rename onto the path of a different existing asset would violate asset.path's uniqueness: refuse it
+    clearly (unless that asset is itself renamed away by this diff)."""
+    moves = {e["old_path"]: e["path"] for e in entries if e["old_path"] and e["old_path"] != e["path"]}
+    if not moves:
+        return
+    existing = set(conn.execute(select(asset.c.path).where(asset.c.path.in_([*moves, *moves.values()]))).scalars())
+    for old, new in moves.items():
+        if old in existing and new in existing and new not in moves:
+            raise ValueError(f"asset {new!r}: moved from {old!r}, but both paths are existing assets")
 
 
 def check_totals(conn: Connection, build_id: int, index: dict) -> None:

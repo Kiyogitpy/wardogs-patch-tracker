@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import DBAPIError
 
 from tracker.ingest import TotalsMismatch, ingest
 from tracker.notify import UnknownBuild, make_engine, notify
@@ -46,10 +47,19 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:  # a bad diff (also bad JSON): nothing was written
         print(f"tracker: bad diff, nothing was written: {e}", file=sys.stderr)
         return 1
+    except (DBAPIError, TypeError) as e:  # the database refused the data: nothing was written
+        print(f"tracker: database error, nothing was written: {type(e).__name__}: {_one_line(e)}", file=sys.stderr)
+        return 3
     finally:
         engine.dispose()
     print(f"ingested {args.label}: {result['assets']} assets, {result['changes']} changes; totals match index.json")
     return 0
+
+
+def _one_line(e: Exception) -> str:
+    """The driver's message (not the SQL or its parameters), on one line."""
+    message = str(getattr(e, "orig", None) or e)
+    return " ".join(message.split())[:300]
 
 
 def _notify(parser, url: str, args) -> int:
