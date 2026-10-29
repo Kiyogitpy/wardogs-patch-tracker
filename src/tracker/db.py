@@ -1,6 +1,6 @@
 from sqlalchemy import (
     BigInteger, CheckConstraint, Column, Date, DateTime, ForeignKey, Index, Integer,
-    MetaData, Table, Text,
+    MetaData, Table, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -8,6 +8,8 @@ metadata = MetaData()
 
 ASSET_STATUSES = ("added", "removed", "modified", "moved")
 CHANGE_OPS = ("added", "removed", "changed", "resequenced")
+SUBSCRIPTION_KINDS = ("asset", "area", "field")
+DELIVERY_STATUSES = ("sent", "failed")
 
 
 def _in(column, values):
@@ -78,4 +80,54 @@ build_area = Table(
     Column("position", Integer, nullable=False),  # order in index.json
     Column("title", Text, nullable=False),
     Column("counts", JSONB, nullable=False),
+)
+
+# Accounts and subscriptions (step 4). See docs/API.md and docs/NOTIFY.md.
+
+app_user = Table(
+    "app_user", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("discord_id", Text, nullable=False, unique=True),
+    Column("username", Text, nullable=False),
+    Column("avatar", Text),  # Discord avatar hash
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("last_login_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+# Server-side sessions: the cookie holds a random token, the table only its SHA-256, so a DB leak yields no sessions.
+session = Table(
+    "session", metadata,
+    Column("token_hash", Text, primary_key=True),
+    Column("user_id", Integer, ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+)
+
+subscription = Table(
+    "subscription", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", Integer, ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("kind", Text, nullable=False),
+    # kind "asset" uses asset_id (follows moves); "area" and "field" use target (area id, field substring).
+    Column("asset_id", Integer, ForeignKey("asset.id")),
+    Column("target", Text),
+    Column("webhook_url", Text, nullable=False),  # a secret: never returned unmasked
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("disabled_at", DateTime(timezone=True)),  # set when Discord says the webhook is gone
+    _in("kind", SUBSCRIPTION_KINDS),
+    CheckConstraint("(kind = 'asset') = (asset_id IS NOT NULL) AND (kind = 'asset') = (target IS NULL)",
+                    name="kind_target"),
+    UniqueConstraint("user_id", "kind", "asset_id", "target", "webhook_url", name="subscription_unique",
+                     postgresql_nulls_not_distinct=True),
+)
+
+delivery = Table(
+    "delivery", metadata,
+    Column("subscription_id", Integer, ForeignKey("subscription.id", ondelete="CASCADE"), primary_key=True),
+    Column("build_id", Integer, ForeignKey("build.id", ondelete="CASCADE"), primary_key=True),
+    Column("status", Text, nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("last_error", Text),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    _in("status", DELIVERY_STATUSES),
 )

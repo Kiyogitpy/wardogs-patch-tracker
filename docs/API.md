@@ -1,6 +1,6 @@
 # API contract
 
-JSON over HTTP, all routes under `/api`. Read-only and public. The web app calls these through the Vite dev proxy
+JSON over HTTP, all routes under `/api`. Build data is read-only and public; accounts and subscriptions are below. The web app calls these through the Vite dev proxy
 (`/api` → `http://127.0.0.1:8000`), and in production through the same origin, so no CORS.
 
 Only builds with an ingested diff (`ingested_at` not null) are listed or served. A base build that exists only as
@@ -206,6 +206,91 @@ Order: build newest first, then lower-case asset name and path by code point, th
 ```
 
 `status` is the asset's status in that build.
+
+## Accounts and subscriptions (step 4)
+
+Sign-in is Discord OAuth2 (authorization code, scope `identify`). Readers need no account; only watching does.
+
+### Configuration (environment)
+
+| Variable | Meaning |
+|---|---|
+| `PUBLIC_ORIGIN` | the site's origin, e.g. `https://tracker.example` (dev: `http://localhost:5173`). The OAuth redirect URI is `PUBLIC_ORIGIN + /api/auth/callback`, and the CSRF check compares against it |
+| `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | from the Discord developer portal. Never logged or returned |
+| `COOKIE_SECURE` | `1` (default) sets `Secure` on cookies; `0` only for http dev |
+
+When the Discord variables are missing, `/api/auth/login` returns 503 `{"detail": "sign-in is not configured"}`;
+everything read-only keeps working.
+
+### Cookies and CSRF
+
+- `oauth_state`: random 32-byte URL-safe value, HttpOnly, SameSite=Lax, path `/api/auth`, 10 minutes. It also
+  carries the `next` path (see below), e.g. `<state>.<base64url(next)>`.
+- `session`: random 32-byte URL-safe token, HttpOnly, SameSite=Lax, path `/`, 30 days. The database stores only its
+  SHA-256 (`session.token_hash`) with `expires_at`; an expired or unknown token is treated as signed out.
+- Every non-GET request under `/api` must carry an `Origin` header equal to `PUBLIC_ORIGIN`; otherwise 403
+  `{"detail": "bad origin"}`. Bodies are JSON; another `Content-Type` is 415.
+
+### `GET /api/auth/login?next=/path`
+
+302 to `https://discord.com/oauth2/authorize` with `client_id`, `redirect_uri`, `response_type=code`, `scope=identify`,
+`state`, `prompt=none`. `next` must start with `/` and not with `//` or `/\`; anything else becomes `/` (no open
+redirect).
+
+### `GET /api/auth/callback?code=&state=`
+
+Checks `state` against the cookie (constant-time), exchanges the code at `https://discord.com/api/oauth2/token`,
+reads `https://discord.com/api/users/@me`, upserts `app_user` by `discord_id` (refreshing `username`, `avatar`,
+`last_login_at`), creates a session, clears `oauth_state`, sets `session`, and 302s to `next`. Any failure (missing or
+wrong state, Discord error, `error=access_denied`) 302s to `/?signin=failed` without creating a session. Discord
+calls time out after 10 s.
+
+### `POST /api/auth/logout`
+
+Deletes the session row, clears the cookie. 204, also when already signed out.
+
+### `GET /api/me`
+
+200 `{"discord_id": "80351110224678912", "username": "kiyo", "avatar_url": "https://cdn.discordapp.com/avatars/<id>/<hash>.png" | null}`,
+or 401 `{"detail": "not signed in"}`.
+
+### `GET /api/subscriptions`
+
+The signed-in user's subscriptions, newest first. 401 when signed out.
+
+```json
+[
+  {
+    "id": 7,
+    "kind": "asset",
+    "target": null,
+    "asset": {"path": "Wardogs/Content/.../DA_308Winchester_ProjectileData.json", "name": "DA_308Winchester_ProjectileData"},
+    "webhook": "https://discord.com/api/webhooks/1234567890/…k3Zq",
+    "created_at": "2026-10-29T15:00:00+00:00",
+    "disabled_at": null,
+    "last_delivery": {"build": "s3-26000000", "status": "sent", "updated_at": "2026-11-20T10:00:00+00:00"}
+  }
+]
+```
+
+`webhook` is masked: the webhook id, then `…` and the last 4 characters of the token. `asset` is null unless
+`kind` is `asset`. `last_delivery` is the newest delivery row, or null.
+
+### `POST /api/subscriptions`
+
+Body: `{"kind": "asset", "asset_path": "...", "webhook_url": "..."}`, or `{"kind": "area" | "field", "target": "...", "webhook_url": "..."}`.
+
+- `asset_path` resolves like `GET /api/asset` (a former path finds the asset it moved to); unknown is 422.
+- `area` targets must be an area id present in some ingested build; `field` targets are 2–200 characters, no NUL.
+- `webhook_url` must match `^https://(discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)/api/webhooks/\d{1,20}/[A-Za-z0-9_-]{1,100}$`.
+  The server never fetches it here (no outbound request on user input).
+- At most 25 subscriptions per user (422 `{"detail": "subscription limit reached"}`); an identical subscription is 409.
+
+201 with the item as in the list.
+
+### `DELETE /api/subscriptions/{id}`
+
+204; 404 when it does not exist or belongs to someone else (no existence leak).
 
 ## Errors
 
