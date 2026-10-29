@@ -35,9 +35,9 @@ stored; `season_diff.py` owns that classification. Migrations are in `migrations
 
 ## Roadmap
 
-1. ~~Schema and ingest~~
-2. ~~API (`docs/API.md`) and the build diff view~~
-3. ~~Field history across builds and search~~ (design: `docs/DESIGN.md`)
+1. Schema and ingest (done)
+2. API (`docs/API.md`) and the build diff view (done)
+3. Field history across builds and search (done; design: `docs/DESIGN.md`)
 4. Public deployment; Discord OAuth login for subscriptions to assets, areas or field patterns, delivered by Discord
    webhook after each ingest
 
