@@ -4,7 +4,8 @@ from collections import defaultdict
 from functools import cache
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, case, create_engine, exists, func, select
 
 from tracker.db import asset, asset_alias, asset_status, build, build_area, change
@@ -20,6 +21,21 @@ Offset = Annotated[int, Query(ge=0, le=1_000_000)]
 NEWEST_FIRST = (build.c.released_at.desc().nulls_last(), build.c.id.desc())
 
 app = FastAPI(title="Wardogs patch tracker")
+
+
+@app.middleware("http")
+async def check_origin(request: Request, call_next):
+    """CSRF defence for state-changing requests: Origin must equal PUBLIC_ORIGIN (unset fails closed); JSON bodies only."""
+    path = request.url.path
+    if (path == "/api" or path.startswith("/api/")) and request.method not in ("GET", "HEAD", "OPTIONS"):
+        expected = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
+        if not expected or request.headers.get("origin") != expected:
+            return JSONResponse({"detail": "bad origin"}, status_code=403)
+        has_body = request.headers.get("content-length", "0") != "0" or "transfer-encoding" in request.headers
+        media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if has_body and media_type != "application/json":
+            return JSONResponse({"detail": "content type must be application/json"}, status_code=415)
+    return await call_next(request)
 
 
 @cache
@@ -192,18 +208,23 @@ def search_assets(q: Filter = None, limit: Limit = 50, offset: Offset = 0):
     }
 
 
+def resolve_asset(conn, path: str):
+    """The asset at `path`, or the one that most recently moved from it (a former path); None when unknown."""
+    row = conn.execute(select(asset).where(asset.c.path == path, _in_ingested_build(asset.c.id))).first()
+    if row is None:
+        row = conn.execute(
+            select(asset).select_from(asset_alias.join(asset, asset.c.id == asset_alias.c.asset_id)
+                                      .join(build, build.c.id == asset_alias.c.build_id))
+            .where(asset_alias.c.old_path == path, build.c.ingested_at.is_not(None))
+            .order_by(*NEWEST_FIRST).limit(1)
+        ).first()
+    return row
+
+
 @app.get("/api/asset")
 def get_asset(path: Annotated[str, Query(max_length=1000, pattern=r"^[^\x00]*$")], field: Filter = None):
     with get_engine().connect() as conn:
-        row = conn.execute(select(asset).where(asset.c.path == path, _in_ingested_build(asset.c.id))).first()
-        if row is None:
-            # A former path: the asset that moved from it most recently.
-            row = conn.execute(
-                select(asset).select_from(asset_alias.join(asset, asset.c.id == asset_alias.c.asset_id)
-                                          .join(build, build.c.id == asset_alias.c.build_id))
-                .where(asset_alias.c.old_path == path, build.c.ingested_at.is_not(None))
-                .order_by(*NEWEST_FIRST).limit(1)
-            ).first()
+        row = resolve_asset(conn, path)
         if row is None:
             raise HTTPException(404, "asset not found")
 
@@ -281,3 +302,8 @@ def list_changes(
             for r in rows
         ],
     }
+
+
+from tracker.accounts import router  # noqa: E402  (accounts reaches back into this module lazily)
+
+app.include_router(router)
