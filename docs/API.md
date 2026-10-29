@@ -224,9 +224,11 @@ everything read-only keeps working.
 
 ### Cookies and CSRF
 
-- `oauth_state`: random 32-byte URL-safe value, HttpOnly, SameSite=Lax, path `/api/auth`, 10 minutes. It also
+- `__Host-oauth_state`: random 32-byte URL-safe value, HttpOnly, Secure, SameSite=Lax, path `/`, no Domain, 10 minutes. It also
   carries the `next` path (see below), e.g. `<state>.<base64url(next)>`.
-- `session`: random 32-byte URL-safe token, HttpOnly, SameSite=Lax, path `/`, 30 days. The database stores only its
+- `__Host-session`: random 32-byte URL-safe token, HttpOnly, Secure, SameSite=Lax, path `/`, no Domain, 30 days.
+- The `__Host-` prefix needs `Secure`. With `COOKIE_SECURE=0` (plain http dev) the names are `oauth_state` (path
+  `/api/auth`) and `session`, without `Secure`. The database stores only its
   SHA-256 (`session.token_hash`) with `expires_at`; an expired or unknown token is treated as signed out.
 - Every non-GET request under `/api` must carry an `Origin` header equal to `PUBLIC_ORIGIN`; otherwise 403
   `{"detail": "bad origin"}`. Bodies are JSON; another `Content-Type` is 415.
@@ -243,7 +245,9 @@ Checks `state` against the cookie (constant-time), exchanges the code at `https:
 reads `https://discord.com/api/users/@me`, upserts `app_user` by `discord_id` (refreshing `username`, `avatar`,
 `last_login_at`), creates a session, clears `oauth_state`, sets `session`, and 302s to `next`. Any failure (missing or
 wrong state, Discord error, `error=access_denied`) 302s to `/?signin=failed` without creating a session. Discord
-calls time out after 10 s.
+calls time out after 10 s. At most 4 code exchanges run at once; over that, the callback 302s to `/?signin=failed`
+at once. A Discord username with a control character (NUL, newline, ...) fails sign-in the same way. Each sign-in also
+deletes every expired session, not just the user's own.
 
 ### `POST /api/auth/logout`
 
@@ -285,7 +289,8 @@ Body: `{"kind": "asset", "asset_path": "...", "webhook_url": "..."}`, or `{"kind
 - `asset_path` resolves like `GET /api/asset` (a former path finds the asset it moved to); unknown is 422.
 - `area` targets must be an area id present in some ingested build; `field` targets are 2–200 characters, no NUL.
 - `webhook_url` must match `^https://(discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)/api/webhooks/\d{1,20}/[A-Za-z0-9_-]{1,100}$`.
-  The server never fetches it here (no outbound request on user input).
+  The host is stored as `discord.com` whatever alias was posted, so `discordapp.com`, `ptb.` and `canary.` links to the
+  same webhook are duplicates (409). The server never fetches it here (no outbound request on user input).
 - At most 25 subscriptions per user (422 `{"detail": "subscription limit reached"}`); an identical subscription is 409.
 
 201 with the item as in the list.
@@ -296,4 +301,12 @@ Body: `{"kind": "asset", "asset_path": "...", "webhook_url": "..."}`, or `{"kind
 
 ## Errors
 
-FastAPI defaults: 404 `{"detail": "..."}`, 422 validation body. No other error shapes.
+FastAPI defaults: 404 `{"detail": "..."}`, 422 validation body. Besides those, all under `/api`:
+
+- 413 `{"detail": "request body too large"}`: a body over 64 KiB, by `Content-Length` or by counting the streamed
+  bytes of a chunked request (reading stops at the limit). This runs before authentication.
+- 429 `{"detail": "too many requests"}` with a `Retry-After` header (seconds): a per-client-IP token bucket kept in
+  memory, 10 requests a minute (burst 5) for `/api/auth/*` and 120 a minute (burst 60) for everything else. The IP is
+  the connection's client address, which uvicorn's proxy-headers sets from the trusted proxy.
+- 503 `{"detail": "query took too long, narrow the search"}`: a read query exceeded the API's 3 s `statement_timeout`.
+

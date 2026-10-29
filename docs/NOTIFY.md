@@ -41,12 +41,26 @@ One webhook `POST` per subscription, JSON body:
 ```
 
 - `allowed_mentions: {"parse": []}` is mandatory: values come from game data, and `@everyone` in a string must not ping.
-- Discord limits: title ≤ 256 characters, description ≤ 4096; truncate with `…` and end with "and N more" plus the
-  link. Values in lines are shortened to 80 characters.
+- Game text is hostile and never rendered as Markdown. Field paths and non-numeric values go in a code span (backticks
+  inside them are replaced with `ˋ`, so the span cannot be closed). Names, area titles and targets in titles and bold
+  prefixes are backslash-escaped (\  *  _  ~  |  >  [  ]  (  )  #  <  `, a leading `-`, `+` or `1.`), newlines become spaces, and
+  `://` is written `:\/\/` so no bare URL is clickable.
+- Discord limits: title ≤ 256 characters, description ≤ 4096, footer ≤ 2048, `url` ≤ 2048, and title + description +
+  footer ≤ 6000 (the description shrinks to fit). Truncate with `…` and end with "and N more" plus the link. Values
+  are shortened to 80 characters, field paths to 200, names to 100 (before escaping, so a cut never splits an
+  escape). If the link would exceed 2048 characters (a very long asset path) it points at `/builds/<B>` instead.
+- Numbers at or beyond 1e300 in magnitude, and any pair whose difference cannot be computed, are shown as plain
+  values without a delta.
 - Links: asset → `/asset?path=`, area → `/builds/<B>?area=<id>`, field → `/changes?field=<target>&build=<B>`, all
   URL-encoded.
 
 ## Delivery state
+
+Each subscription is built, checked and sent in its own `try`: an unexpected error is logged (subscription id and
+exception class only), recorded as `failed` with `last_error = "internal error: <ExceptionClass>"`, and the run
+continues with the others. Before sending, the stored URL is checked again against the same pattern as sign-up
+(`tracker/webhooks.py`); a stored value that fails is not called, is recorded `failed` with `last_error = "invalid
+webhook"` (0 attempts) and gets `disabled_at`.
 
 `delivery` has one row per (subscription, build), written after each attempt:
 
