@@ -1,0 +1,120 @@
+# Raspberry Pi behind Tailscale Funnel. Funnel terminates TLS and forwards to Caddy, which listens
+# on plain http at 127.0.0.1:8080 only (deploy/Caddyfile.pi). Run from this folder:
+#   cp deploy/.env.example .env && edit .env   (PUBLIC_ORIGIN=https://<host>.<tailnet>.ts.net)
+#   docker compose -f compose.pi.yaml up -d --build
+#   sudo tailscale funnel --bg 8080
+# Standalone, not an override: keep it in sync with compose.prod.yaml (same db, migrate, app).
+#
+# Networks: `edge` (caddy + app, fixed subnet so uvicorn can trust exactly that range for
+# X-Forwarded-For) and `backend` (app + db, no outside access). Only caddy publishes ports.
+#
+# Restart policy: "unless-stopped" restarts a container that EXITS, but Docker never restarts one
+# that is merely "unhealthy". Healthchecks here gate start order and show in `docker compose ps`.
+# A hung (not crashed) service needs `docker compose restart <name>` or an external watchdog.
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  db:
+    <<: *hardening
+    image: postgres:16.15
+    mem_limit: 1g
+    pids_limit: 300
+    environment:
+      # The owner role. Used only by `migrate`; the app connects as tracker_app (see DEPLOY.md).
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: tracker
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  # One-shot: alembic as the owner role, then create/refresh the DML-only tracker_app role.
+  migrate:
+    image: ${APP_IMAGE:-wardogs-patch-tracker:latest}
+    build: .
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    read_only: true
+    tmpfs: ["/tmp:size=64m,noexec,nosuid"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    pids_limit: 100
+    command: ["python", "/app/deploy/db_setup.py"]
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL:?set MIGRATE_DATABASE_URL in .env}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+
+  app:
+    <<: *hardening
+    image: ${APP_IMAGE:-wardogs-patch-tracker:latest}
+    read_only: true
+    tmpfs: ["/tmp:size=64m,noexec,nosuid"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 200
+    # Listed one by one so the owner URL (MIGRATE_DATABASE_URL) never enters this container.
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      # Trust X-Forwarded-For only from the edge network (caddy sets it to the client address).
+      FORWARDED_ALLOW_IPS: 172.29.57.0/24
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Not published to the host: only Caddy reaches it over the edge network.
+    networks: [edge, backend]
+
+  caddy:
+    <<: *hardening
+    image: caddy:2.11.7
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.pi", "--adapter", "caddyfile"]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]  # the caddy binary carries this file capability; without it, exec fails
+    mem_limit: 256m
+    pids_limit: 200
+    ports:
+      # Loopback only: nothing on the LAN or the internet reaches Caddy except through Funnel.
+      # PI_PORT exists for local tests; leave it at 8080 and run `tailscale funnel --bg 8080`.
+      - "127.0.0.1:${PI_PORT:-8080}:8080"
+    volumes:
+      - ./deploy:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [edge]
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.29.57.0/24
+  backend:
+    internal: true
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

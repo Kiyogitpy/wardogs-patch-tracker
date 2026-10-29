@@ -62,4 +62,4 @@ npm run build        # type-check and build to web/dist
 
 ## Deploy
 
-`Dockerfile` builds one image (web app plus API); `compose.prod.yaml` runs it with Postgres and Caddy (automatic HTTPS) on any Docker host. Copy `deploy/.env.example` to `.env`, fill it in, then `docker compose -f compose.prod.yaml up -d --build`. Full steps (DNS, Discord app, loading data, backup, rollback) are in `docs/DEPLOY.md`.
+`Dockerfile` builds one image (web app plus API); `compose.prod.yaml` runs it with Postgres and Caddy (automatic HTTPS) on any Docker host. Copy `deploy/.env.example` to `.env`, fill it in, then `docker compose -f compose.prod.yaml up -d --build`. The stack is hardened (read-only containers, a DML-only database role, security headers, request limits, pinned images). For a Raspberry Pi behind Tailscale Funnel use `compose.pi.yaml`. Full steps (DNS, Discord app, loading data, backup, rollback) are in `docs/DEPLOY.md`.

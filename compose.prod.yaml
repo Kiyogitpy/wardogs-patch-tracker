@@ -1,11 +1,25 @@
 # Production stack: Caddy (TLS) -> app (API + web) -> Postgres. Run from this folder:
 #   cp deploy/.env.example .env && edit .env
 #   docker compose -f compose.prod.yaml up -d --build
+#
+# Networks: `edge` (caddy + app, fixed subnet so uvicorn can trust exactly that range for
+# X-Forwarded-For) and `backend` (app + db, no outside access). Only caddy publishes ports.
+#
+# Restart policy: "unless-stopped" restarts a container that EXITS, but Docker never restarts one
+# that is merely "unhealthy". Healthchecks here gate start order and show in `docker compose ps`.
+# A hung (not crashed) service needs `docker compose restart <name>` or an external watchdog.
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
 services:
   db:
-    image: postgres:16
-    restart: unless-stopped
+    <<: *hardening
+    image: postgres:16.15
+    mem_limit: 1g
+    pids_limit: 300
     environment:
+      # The owner role. Used only by `migrate`; the app connects as tracker_app (see DEPLOY.md).
       POSTGRES_USER: tracker
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: tracker
@@ -16,37 +30,87 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks: [backend]
 
-  app:
+  # One-shot: alembic as the owner role, then create/refresh the DML-only tracker_app role.
+  migrate:
     image: ${APP_IMAGE:-wardogs-patch-tracker:latest}
     build: .
-    restart: unless-stopped
-    env_file: .env
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    read_only: true
+    tmpfs: ["/tmp:size=64m,noexec,nosuid"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    pids_limit: 100
+    command: ["python", "/app/deploy/db_setup.py"]
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL:?set MIGRATE_DATABASE_URL in .env}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
     depends_on:
       db:
         condition: service_healthy
-    # Not published to the host: only Caddy reaches it over the compose network.
+    networks: [backend]
+
+  app:
+    <<: *hardening
+    image: ${APP_IMAGE:-wardogs-patch-tracker:latest}
+    read_only: true
+    tmpfs: ["/tmp:size=64m,noexec,nosuid"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 200
+    # Listed one by one so the owner URL (MIGRATE_DATABASE_URL) never enters this container.
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      # Trust X-Forwarded-For only from the edge network (caddy sets it to the client address).
+      FORWARDED_ALLOW_IPS: 172.29.57.0/24
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Not published to the host: only Caddy reaches it over the edge network.
+    networks: [edge, backend]
 
   caddy:
-    image: caddy:2
-    restart: unless-stopped
+    <<: *hardening
+    image: caddy:2.11.7
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    mem_limit: 256m
+    pids_limit: 200
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN in .env}
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"  # HTTP/3 (QUIC)
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
       app:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "caddy", "version"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
       interval: 30s
       timeout: 5s
       retries: 3
+    networks: [edge]
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.29.57.0/24
+  backend:
+    internal: true
 
 volumes:
   pgdata:
