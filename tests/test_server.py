@@ -138,13 +138,43 @@ def test_access_log_filter_is_installed(caplog):
 GOOD = {"DATABASE_URL": "postgresql+psycopg://u:abc123@db/t", "PUBLIC_ORIGIN": "https://t.example.com"}
 
 
+def origin(value, **extra):
+    return {**GOOD, "PUBLIC_ORIGIN": value, **extra}
+
+
 @pytest.mark.parametrize("env, message", [
     ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:change-me@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:CHANGE-ME@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:ChangeMe@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:PASSWORD@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u:%20%20@db/t"}, "DATABASE_URL"),
+    ({**GOOD, "DATABASE_URL": "postgresql+psycopg://u@db/t"}, "DATABASE_URL"),
     ({**GOOD, "MIGRATE_DATABASE_URL": "postgresql+psycopg://u:change-me@db/t"}, "MIGRATE_DATABASE_URL"),
+    ({**GOOD, "MIGRATE_DATABASE_URL": "postgresql+psycopg://u:Password@db/t"}, "MIGRATE_DATABASE_URL"),
     ({"DATABASE_URL": GOOD["DATABASE_URL"]}, "PUBLIC_ORIGIN is not set"),
-    ({**GOOD, "PUBLIC_ORIGIN": "http://t.example.com"}, "must be https"),
-    ({**GOOD, "PUBLIC_ORIGIN": "http://localhost:8000"}, "COOKIE_SECURE=0"),
-    ({**GOOD, "PUBLIC_ORIGIN": "http://localhost.evil.com", "COOKIE_SECURE": "0"}, "must be https"),
+    (origin("http://t.example.com"), "must be https"),
+    (origin("http://localhost:8000"), "COOKIE_SECURE=0"),
+    (origin("http://localhost.evil.com", COOKIE_SECURE="0"), "must be https"),
+    # Reviewer's bypasses:
+    (origin("https://evil.com/path/x"), "must not have a path"),
+    (origin("https://user:pw@evil.com"), "user info"),
+    (origin("https://?x"), "PUBLIC_ORIGIN"),
+    (origin("https://a b"), "whitespace"),
+    (origin("https://t.example.com "), "whitespace"),
+    (origin(" https://t.example.com"), "whitespace"),
+    (origin("https://t.example.com\\@evil.com"), "backslash"),
+    (origin("https://t.example.com?x=1"), "query"),
+    (origin("https://t.example.com#f"), "fragment"),
+    (origin("https://t.example.com:notaport"), "PUBLIC_ORIGIN"),
+    (origin("https://"), "PUBLIC_ORIGIN"),
+    (origin("ftp://t.example.com"), "must be https"),
+    (origin("http://localhost:80@evil.com", COOKIE_SECURE="0"), "user info"),
+    (origin("http://localhost:@evil.com", COOKIE_SECURE="0"), "user info"),
+    (origin("http://localhost@evil.com", COOKIE_SECURE="0"), "user info"),
+    (origin("https://t.example.com", COOKIE_SECURE="0"), "COOKIE_SECURE=0"),
+    (origin("https://localhost", COOKIE_SECURE="0"), "COOKIE_SECURE=0"),
+    (origin("http://localhost.evil.com"), "must be https"),
 ])
 def test_check_environment_refuses(env, message):
     with pytest.raises(RuntimeError, match=message):
@@ -153,8 +183,13 @@ def test_check_environment_refuses(env, message):
 
 @pytest.mark.parametrize("env", [
     GOOD,
+    origin("https://t.example.com/"),
+    origin("https://t.example.com:8443"),
+    origin("https://localhost.evil.com"),  # https is fine; it is just not "localhost over http"
+    origin("https://localhost", COOKIE_SECURE="1"),
     {**GOOD, "PUBLIC_ORIGIN": "http://localhost:8000", "COOKIE_SECURE": "0"},
     {**GOOD, "PUBLIC_ORIGIN": "http://localhost", "COOKIE_SECURE": "0"},
+    {**GOOD, "PUBLIC_ORIGIN": "http://127.0.0.1:8000", "COOKIE_SECURE": "0"},
 ])
 def test_check_environment_accepts(env):
     check_environment(env)

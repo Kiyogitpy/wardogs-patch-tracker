@@ -8,7 +8,10 @@ so client-side routes work on reload.
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from sqlalchemy import make_url
+from sqlalchemy.exc import ArgumentError
 from starlette.responses import FileResponse, PlainTextResponse
 
 from tracker.api import app as api_app
@@ -56,20 +59,57 @@ class _StripQuery(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_StripQuery())
 
 
+PLACEHOLDER_PASSWORDS = {"", "change-me", "changeme", "password"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+
+
+def _origin_problem(raw: str) -> str | None:
+    """Why `raw` cannot be the public origin, or None. Strict: scheme://host[:port] and nothing else."""
+    if any(c.isspace() or c in "\\?#" for c in raw):
+        return "must not contain whitespace, backslash, query or fragment"
+    try:
+        parts = urlsplit(raw)
+        parts.port  # noqa: B018 - raises ValueError for a bad port
+    except ValueError:
+        return "is not a valid URL"
+    if parts.scheme not in ("http", "https"):
+        return "must be https"
+    if "@" in parts.netloc:
+        return "must not contain user info"
+    if not parts.hostname:
+        return "has no hostname"
+    if parts.path not in ("", "/"):
+        return "must not have a path"
+    return None
+
+
 def check_environment(env=os.environ) -> None:
     """Refuse to serve with placeholder secrets or an origin that cannot be right in production."""
     for name in ("DATABASE_URL", "MIGRATE_DATABASE_URL"):
-        if "change-me" in env.get(name, ""):
-            raise RuntimeError(f"{name} still contains the 'change-me' placeholder; set a real password in .env")
-    origin = env.get("PUBLIC_ORIGIN", "").rstrip("/")
+        url = env.get(name)
+        if not url:
+            continue
+        try:
+            password = make_url(url).password
+        except ArgumentError:
+            raise RuntimeError(f"{name} is not a valid database URL") from None
+        if "change-me" in url.lower() or (password or "").strip().lower() in PLACEHOLDER_PASSWORDS:
+            raise RuntimeError(f"{name} has an empty or placeholder password (change-me...); set a real one in .env")
+    origin = env.get("PUBLIC_ORIGIN", "")
     if not origin:
         raise RuntimeError("PUBLIC_ORIGIN is not set (expected https://<your-domain>)")
-    local_http = origin == "http://localhost" or origin.startswith("http://localhost:")
-    if local_http:
-        if env.get("COOKIE_SECURE") != "0":
-            raise RuntimeError("PUBLIC_ORIGIN is http://localhost; that is only allowed with COOKIE_SECURE=0")
-    elif not origin.startswith("https://"):
+    problem = _origin_problem(origin)
+    if problem:
+        raise RuntimeError(f"PUBLIC_ORIGIN {problem} (got {origin!r}); expected https://<your-domain>[:port]")
+    parts = urlsplit(origin)
+    local_http = parts.scheme == "http" and parts.hostname in LOCAL_HOSTS
+    if parts.scheme == "http" and not local_http:
         raise RuntimeError(f"PUBLIC_ORIGIN must be https (got {origin!r})")
+    insecure = env.get("COOKIE_SECURE") == "0"
+    if local_http and not insecure:
+        raise RuntimeError(f"PUBLIC_ORIGIN is {origin}; plain http is only allowed with COOKIE_SECURE=0")
+    if insecure and not local_http:
+        raise RuntimeError("COOKIE_SECURE=0 is only allowed with an http://localhost PUBLIC_ORIGIN")
 
 
 def _is_api(path: str) -> bool:
