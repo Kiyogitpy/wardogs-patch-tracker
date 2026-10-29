@@ -34,6 +34,7 @@ ATTEMPTS = 3
 BACKOFF = (1, 4)
 RETRY_AFTER_CAP = 30
 TIMEOUT = 10
+RUN_DEADLINE = 1800  # seconds one notify run may keep starting messages
 BUDGET = 60  # seconds one subscription may take over all its attempts, waits included
 MAX_RATE_SLEEP = 40  # of which at most this many may be spent waiting out 429s
 STATEMENT_TIMEOUT_MS = 60_000  # per statement on the notify engine
@@ -282,11 +283,15 @@ def _error(code: int, response: httpx.Response, webhook: str) -> str:
 
 
 def _retry_after(response: httpx.Response) -> float:
+    """The seconds Discord asks to wait, capped; 1 s when the field is missing, not a number, not finite or negative."""
     try:
-        value = float(response.json()["retry_after"])
-    except (ValueError, KeyError, TypeError):
-        value = 1.0
-    return min(max(value, 0.0), RETRY_AFTER_CAP)
+        value = response.json()["retry_after"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 1.0
+        value = float(value)
+    except (ValueError, KeyError, TypeError, OverflowError):
+        return 1.0
+    return min(value, RETRY_AFTER_CAP) if math.isfinite(value) and value >= 0 else 1.0
 
 
 def send(client: httpx.Client, webhook: str, body: dict, sleep, clock=time.monotonic) -> tuple[str, int, str | None, bool]:
@@ -340,8 +345,12 @@ def _record(engine, sub_id: int, build_id: int, status: str, tries: int, error: 
 
 
 def notify(engine, label: str, public_origin: str, client: httpx.Client | None = None, dry_run: bool = False,
-           sleep=time.sleep, clock=time.monotonic) -> dict:
-    """Send every due message for build `label`. Raises UnknownBuild if it is not ingested."""
+           sleep=time.sleep, clock=time.monotonic, deadline_seconds: float = RUN_DEADLINE) -> dict:
+    """Send every due message for build `label`. Raises UnknownBuild if it is not ingested.
+
+    The run has an overall deadline: once `deadline_seconds` have passed since sending began, no further message is
+    started (one already under way may take up to BUDGET more seconds). The rest get no delivery row, so a re-run
+    picks them up; summary["skipped"] counts them."""
     origin = public_origin.rstrip("/")
     with engine.connect() as conn:
         b = None if "\x00" in label else conn.execute(
@@ -364,7 +373,7 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
             if body is not None:
                 due.append((sub, body))
 
-    summary = {"label": label, "matched": len(due), "sent": 0, "failed": 0, "disabled": 0, "messages": []}
+    summary = {"label": label, "matched": len(due), "sent": 0, "failed": 0, "disabled": 0, "skipped": 0, "messages": []}
     if dry_run:
         summary["messages"] = [{"subscription_id": s.id, "body": body} for s, body in due]
         return summary
@@ -375,7 +384,13 @@ def notify(engine, label: str, public_origin: str, client: httpx.Client | None =
     own_client = client is None
     client = client or httpx.Client()
     try:
-        for sub, body in due:
+        run_ends = clock() + deadline_seconds
+        for position, (sub, body) in enumerate(due):
+            if clock() >= run_ends:
+                summary["skipped"] = len(due) - position
+                log.error("run deadline of %s s reached: %s subscription(s) not sent, a re-run sends them",
+                          deadline_seconds, summary["skipped"])
+                break
             try:
                 if not WEBHOOK_RE.fullmatch(sub.webhook_url):  # the stored value is re-checked before it is used
                     status, tries, error, gone = "failed", 0, "invalid webhook", True
