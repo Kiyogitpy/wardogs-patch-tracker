@@ -3,9 +3,10 @@ import { Link, useSearchParams } from 'react-router'
 import { getBuild, getChanges, listBuilds, PAGE_SIZE } from '../api'
 import { Empty, ErrorBox, Loading } from '../components/State'
 import Pager from '../components/Pager'
-import { nf, StatusBadge } from '../components/Stats'
-import ValueView from '../components/ValueView'
-import { numberPair, numericDelta } from '../format'
+import { FieldPath } from '../components/AssetCard'
+import BeforeAfter from '../components/BeforeAfter'
+import { nf, OP_BAR, StatusBadge } from '../components/Stats'
+import { readableAsset } from '../hero'
 import { useRemote, useTitle, useUrlText } from '../hooks'
 import {
   changesApiQuery,
@@ -112,7 +113,7 @@ export default function Changes() {
             {data.total > PAGE_SIZE && (
               <span className="muted">
                 {' '}
-                &middot; page {state.page} of {pages}
+                page {state.page} of {pages}
               </span>
             )}
           </>
@@ -123,8 +124,10 @@ export default function Changes() {
       <div aria-live="polite">
         {!ready && <Empty>Enter at least {MIN_FIELD_CHARS} characters of a field path to search.</Empty>}
         {ready && res.state === 'loading' && <Loading what="changes" />}
-        {ready && res.state === 'error' && <ErrorBox error={res.error} onRetry={res.retry} />}
-        {ready && data && data.total === 0 && <Empty>No changes match these filters.</Empty>}
+        {ready && res.state === 'error' && <ErrorBox what="the changes" error={res.error} onRetry={res.retry} />}
+        {ready && data && data.total === 0 && <Empty>
+            No changes match these filters. <Link to={`?${changesToParams(EMPTY_CHANGES)}`} onClick={() => setFieldText('')}>Clear filters</Link>
+          </Empty>}
         {ready && data && data.total > 0 && data.items.length === 0 && (
           <Empty>
             Page {state.page} is past the end.{' '}
@@ -135,58 +138,37 @@ export default function Changes() {
       {ready && data && data.items.length > 0 && (
         <>
           <div className="table-wrap" tabIndex={0} role="region" aria-label="Field changes">
-            <table className="changes results wide">
+            <table className="rows stack results wide">
               <thead>
                 <tr>
-                  <th scope="col">Build</th>
                   <th scope="col">Asset</th>
                   <th scope="col">Field</th>
-                  <th scope="col">Op</th>
-                  <th scope="col">Before &rarr; after</th>
-                  <th scope="col">Delta</th>
+                  <th scope="col">Before to after</th>
+                  <th scope="col">Build</th>
                 </tr>
               </thead>
               <tbody>
-                {data.items.map((c, i) => {
-                  const d = numericDelta(c.before, c.after)
-                  const pair =
-                    typeof c.before === 'number' && typeof c.after === 'number' ? numberPair(c.before, c.after) : null
-                  return (
-                    <tr key={`${c.build}:${c.asset.path}:${c.field_path}:${i}`}>
-                      <th scope="row" className="nowrap">
-                        <Link to={`/builds/${encodeURIComponent(c.build)}`} className="mono">
-                          {c.build}
-                        </Link>
-                      </th>
-                      <td>
-                        <Link to={`/asset?${new URLSearchParams({ path: c.asset.path })}`} className="asset-link">
-                          {c.asset.name}
-                        </Link>{' '}
-                        <StatusBadge status={c.status} />
-                      </td>
-                      <td className="fieldcell">{c.field_path}</td>
-                      <td>
-                        <span className={`op op-${c.op}`}>{c.op}</span>
-                      </td>
-                      <td>
-                        <div className="ba">
-                          <ValueView value={c.before} numText={pair?.[0]} absent={c.op === 'added' && c.before === null} />
-                          <span aria-hidden="true">&rarr;</span>
-                          <span className="sr-only">changed to</span>
-                          <ValueView value={c.after} numText={pair?.[1]} absent={c.op === 'removed' && c.after === null} />
-                        </div>
-                      </td>
-                      <td className="delta">
-                        {d && (
-                          <span className={d.delta.startsWith('+') ? 'up' : d.delta.startsWith('−') ? 'down' : ''}>
-                            {d.delta}
-                            {d.pct && <span className="pct"> ({d.pct})</span>}
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
+                {data.items.map((c, i) => (
+                  <tr key={`${c.build}:${c.asset.path}:${c.field_path}:${i}`} className={`mark ${OP_BAR[c.op]}`}>
+                    <th scope="row" className="c-asset">
+                      <Link to={`/asset?${new URLSearchParams({ path: c.asset.path })}`} className="asset-link">
+                        {readableAsset(c.asset.name)}
+                      </Link>{' '}
+                      <StatusBadge status={c.status} />
+                    </th>
+                    <td className="c-field field">
+                      <FieldPath path={c.field_path} />
+                    </td>
+                    <td className="c-change">
+                      <BeforeAfter c={c} />
+                    </td>
+                    <td className="c-build">
+                      <Link to={`/builds/${encodeURIComponent(c.build)}`} className="mono">
+                        {c.build}
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

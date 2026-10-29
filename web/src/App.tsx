@@ -42,21 +42,26 @@ export default function App() {
         Skip to content
       </a>
       <header className="masthead">
-        <Link to="/" className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            &#9638;
-          </span>
-          Wardogs Patch Tracker
-        </Link>
-        <nav className="mainnav" aria-label="Main">
-          <NavLink to="/" end>
-            Builds
-          </NavLink>
-          <NavLink to="/changes">Changes</NavLink>
-        </nav>
-        <HeaderSearch />
+        <div className="wrap masthead-in">
+          <Link to="/" className="brand">
+            <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+              <rect width="32" height="32" />
+              <path d="M6 9h20M6 16h20M6 23h12" />
+            </svg>
+            <span className="brand-name">
+              <b>Wardogs</b> patch tracker
+            </span>
+          </Link>
+          <nav className="mainnav" aria-label="Main">
+            <NavLink to="/" end>
+              Builds
+            </NavLink>
+            <NavLink to="/changes">Changes</NavLink>
+          </nav>
+          <HeaderSearch />
+        </div>
       </header>
-      <main id="main" tabIndex={-1}>
+      <main id="main" tabIndex={-1} className="wrap">
         <Routes>
           <Route path="/" element={<Timeline />} />
           <Route path="/builds/:label" element={<BuildDiff />} />
