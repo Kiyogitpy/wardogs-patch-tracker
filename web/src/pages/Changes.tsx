@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { getBuild, getChanges, listBuilds, PAGE_SIZE } from '../api'
+import Watch from '../components/Watch'
 import { Empty, ErrorBox, Loading } from '../components/State'
 import Pager from '../components/Pager'
 import { FieldPath } from '../components/AssetCard'
@@ -105,6 +106,10 @@ export default function Changes() {
           </Link>
         )}
       </form>
+
+      {ready && state.field.trim().length <= 200 && (
+        <Watch target={{ kind: 'field', target: state.field.trim() }} what={`the field ${state.field.trim()}`} />
+      )}
 
       <h2 className="results-title" ref={topRef} tabIndex={-1}>
         {data ? (

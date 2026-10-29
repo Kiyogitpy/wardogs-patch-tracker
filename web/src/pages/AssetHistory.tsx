@@ -4,6 +4,7 @@ import { getAssetHistory, type AssetHistory as History, type HistoryEntry } from
 import { ChangesTable } from '../components/AssetCard'
 import { Empty, ErrorBox, Loading, NotFound } from '../components/State'
 import { OpBadge, StatusBadge } from '../components/Stats'
+import Watch from '../components/Watch'
 import Sparkline from '../components/Sparkline'
 import ValueView from '../components/ValueView'
 import DeltaTag from '../components/DeltaTag'
@@ -168,6 +169,8 @@ export default function AssetHistory() {
           </ul>
         </section>
       )}
+
+      <Watch target={{ kind: 'asset', asset_path: data.path }} what={readableAsset(data.name)} />
 
       <div className="viewbar">
         <div role="group" aria-label="View" className="seg">
