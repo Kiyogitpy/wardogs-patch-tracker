@@ -1,0 +1,95 @@
+# Actions are pinned to commit SHAs (tag in the comment), like the Docker base images are pinned to exact tags.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      # Same image as compose.pi.yaml/compose.prod.yaml, published on the port the tests default to.
+      db:
+        image: postgres:16.15
+        env:
+          POSTGRES_USER: tracker
+          POSTGRES_PASSWORD: tracker
+          POSTGRES_DB: tracker
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tracker -d tracker"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://tracker:tracker@127.0.0.1:5433/tracker_test
+      DATABASE_URL: postgresql+psycopg://tracker:tracker@127.0.0.1:5433/tracker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.0" # same uv as the Dockerfile
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest
+      # README: `alembic check` must report no drift between the models and the migrations.
+      - run: uv run alembic upgrade head
+      - run: uv run alembic check
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.2" # same Node as the Dockerfile
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  # Builds both image targets natively: arm64 is what the Pi runs, amd64 what a VPS runs. Nothing is pushed.
+  docker:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build app image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: app
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=app-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=app-${{ matrix.platform }}
+      - name: Build caddy image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: caddy
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=caddy-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=caddy-${{ matrix.platform }}
