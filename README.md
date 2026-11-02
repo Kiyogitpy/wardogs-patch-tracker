@@ -1,5 +1,7 @@
 # wardogs-patch-tracker
 
+[![CI](https://github.com/Kiyogitpy/wardogs-patch-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/Kiyogitpy/wardogs-patch-tracker/actions/workflows/ci.yml)
+
 History, search and alerts for Wardogs game data across builds. It ingests the per-build diffs that
 `wardogs-data-docs` produces (`update_pipeline.py diff --full` → `season_diff.py`) into Postgres.
 
